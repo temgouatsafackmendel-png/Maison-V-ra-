@@ -1,154 +1,150 @@
-# Architecture Logicielle & Sécurité — Maison Véra E-Commerce
+# Dossier d'Architecture Logicielle — Maison Véra E-Commerce (Normes Internationales)
 
-## 1. Reformulation du Besoin, Utilisateurs & Justification de la Stack
+Ce document décrit l'architecture complète, les choix d'ingénierie, la modélisation des données, les flux transactionnels, la matrice de sécurité (OWASP ASVS) et l'observabilité de la plateforme **Maison Véra — Haute Facture Architecturale (Édition Afrique & International)**.
 
-### 1.1 Objectif Produit & Persona Utilisateurs
-Construire une boutique e-commerce complète, transactionnelle et sécurisée opérant en environnement de paiement test (Sandbox), couvrant l'intégralité de la chaîne de valeur :
-- **Visiteur / Acheteur (Guest ou Client connecté)** : parcours du catalogue par catégorie/recherche, sélection des variantes et finitions, vérification des stocks en temps réel, simulation instantanée du panier avec codes promotionnels, passage de commande idempotent, paiement sandbox et réception d'emails transactionnels simulés.
-- **Client Authentifié (`role = customer`)** : création de compte, authentification sécurisée, consultation de l'historique de ses commandes et de ses emails transactionnels.
-- **Administrateur d'Atelier (`role = admin`)** : gestion des stocks et prix des variantes en temps réel, pilotage des statuts de commandes (avec restitution automatique du stock en cas d'annulation), création/désactivation des coupons, audit des webhooks signés et journal d'audit sécurité.
+---
 
-### 1.2 Justification de l'Architecture Technique
-Suite au refus explicite du provisionnement Cloud externe (Cloud SQL / Firebase) dans l'environnement d'exécution, nous avons retenu une architecture **Full-Stack TypeScript monolithique modulaire** reposant sur :
-- **Frontend** : React 19 + TypeScript strict + Tailwind CSS v4 (design éditorial *Maison Véra*).
-- **Backend API & Domaine** : Node.js + Express 4 + validation stricte **Zod** (`src/server/app.ts`, `src/server/domain.ts`, `src/server/security.ts`).
-- **Base de Données Relationnelle Embarquée** : **SQLite (`better-sqlite3`) en mode WAL (`journal_mode = WAL`, `foreign_keys = ON`)**.
-  - *Justification* : Contrairement à un stockage en mémoire ou JSON fragile, SQLite en mode WAL offre de véritables **transactions ACID sérialisées** (`db.transaction(...)`), des contraintes d'intégrité référentielle (`FOREIGN KEY`), des contraintes `CHECK (stock >= 0)` et des index `UNIQUE` indispensables pour garantir :
-    1. L'absence de survente (*overselling*) lors de la réservation de stock au checkout.
-    2. L'idempotence stricte des commandes (`orders.idempotency_key UNIQUE`) et des webhooks de paiement (`webhook_events.event_id UNIQUE`).
-    3. L'exécution instantanée de la suite de tests d'intégration (`vitest` + `supertest`) sur base isolée `:memory:`.
+## 1. Principes Architecturaux Directeurs (ISO/IEC 25010 & Clean Architecture)
+
+L'application est structurée selon une **architecture modulaire en couches strictement découplées** :
+
+1. **Couche Présentation (`src/App.tsx`, `src/components/*`, `src/utils/format.ts`)**
+   - Responsabilité unique : Expérience utilisateur éditoriale de luxe (*Warm Minimalist Luxury*), gestion du panier réactif, conversion multi-devises d'affichage (`XAF`, `XOF`, `EUR`), mode Éco Data (3G/4G) et parcours d'achat fluide sans aucune exposition de détails d'implémentation serveur.
+2. **Couche Transport & Sécurité HTTP (`src/server/app.ts`)**
+   - Responsabilité unique : En-têtes de sécurité HTTP, corrélation des requêtes (`X-Request-Id`), limitation de débit mémoire-sûre (`Rate Limiter` avec `Retry-After`), validation stricte des schémas d'entrée (**Zod**), authentification par jeton Bearer, contrôle d'accès basé sur les rôles (`requireAuth`, `requireAdmin`) et sérialisation normalisée des erreurs.
+3. **Couche Domaine Métier & Transactions (`src/server/domain.ts`)**
+   - Responsabilité unique : Autorité serveur sur les prix (`calculateCartPricing`), réservation atomique et restitution des stocks (`createCheckoutOrder`, `processPaymentWebhook`), idempotence des paiements et génération des notifications transactionnelles (courriels et résumés SMS/WhatsApp).
+4. **Couche Cryptographie (`src/server/security.ts`)**
+   - Responsabilité unique : Hachage des mots de passe (`PBKDF2-SHA512`, 100 000 itérations), hachage des sessions (`HMAC-SHA256`), et signature/vérification des webhooks en temps constant (`crypto.timingSafeEqual`) avec fenêtre anti-rejeu de 300 secondes.
+5. **Couche Persistance Relationnelle ACID (`src/server/db.ts`)**
+   - Responsabilité unique : Gestion de la base relationnelle **SQLite 3 en mode WAL (`Write-Ahead Logging`)**, intégrité référentielle (`PRAGMA foreign_keys = ON`), indexation secondaire haute performance et migrations idempotentes.
 
 ---
 
 ## 2. Diagramme d'Architecture & Flux Transactionnels (Mermaid)
 
-### 2.1 Architecture Globale des Composants
+### 2.1 Vue des Composants (C4 Container View)
 
 ```mermaid
 flowchart TB
-  subgraph Client["Frontend React 19 (Port 3000)"]
-    UI_Catalog["Catalogue & Fiche Produit (PDP)"]
-    UI_Cart["Panier & Checkout (Idempotency Key)"]
-    UI_Sandbox["Terminal Paiement Sandbox & Webhooks"]
-    UI_Account["Portail Client & Outbox Emails"]
-    UI_Admin["Back-Office Admin (Stocks, Commandes, Coupons, Audit)"]
+  subgraph Browser ["Client Web / Mobile (Afrique & International)"]
+    Storefront["Vitrine & Catalogue\n(XAF / XOF / EUR · Mode Éco Data)"]
+    CartUI["Panier & Checkout Mobile Money\n(MTN MoMo · Orange Money · Wave · Cash)"]
+    PortalUI["Cercle Privé & Suivi Direct\n(WhatsApp · Certificat de Commande)"]
+    AdminUI["Portail de Direction\n(Stocks · Commandes · Codes Privilèges)"]
   end
 
-  subgraph Server["Serveur Node.js / Express (src/server/)"]
-    MW_Sec["Middlewares : Rate Limit, RawBody Capture, RBAC Auth, Zod"]
-    Svc_Domain["EcommerceService (src/server/domain.ts)"]
-    Svc_Crypto["Security Module : PBKDF2-SHA512 & HMAC-SHA256"]
+  subgraph Edge ["Passerelle HTTP Express (src/server/app.ts)"]
+    Headers["Middleware Sécurité & Corrélation\n(X-Request-Id · OWASP Headers · Rate Limit)"]
+    ZodVal["Validation Schémas Zod & Auth RBAC"]
   end
 
-  subgraph Storage["Base Relationnelle SQLite WAL (src/server/db.ts)"]
-    DB_Catalog[("products & product_variants")]
-    DB_Orders[("orders & order_items")]
-    DB_Coupons[("coupons")]
-    DB_Webhooks[("webhook_events (event_id UNIQUE)")]
-    DB_Audit[("simulated_emails & audit_logs")]
+  subgraph Core ["Cœur Métier (src/server/domain.ts & security.ts)"]
+    Pricing["Moteur de Devis Serveur\n(Tarifs SQL · Coupons · Livraison · TVA)"]
+    CheckoutTx["Transaction Atomique Checkout\n(Idempotence + Déduction Stock)"]
+    WebhookTx["Processeur Webhook Signé\n(HMAC-SHA256 + Idempotence + Restitution Stock)"]
   end
 
-  UI_Catalog -->|GET /api/catalog| MW_Sec
-  UI_Cart -->|POST /api/cart/quote & /api/checkout| MW_Sec
-  UI_Sandbox -->|POST /api/webhooks/payment (X-Webhook-Signature)| MW_Sec
-  UI_Account -->|POST /api/auth/* & GET /api/orders/my| MW_Sec
-  UI_Admin -->|GET/PATCH/POST /api/admin/* (Bearer Admin)| MW_Sec
+  subgraph Persistence ["Base de Données Relationnelle (src/server/db.ts)"]
+    SQLite[("SQLite 3 WAL\n9 Tables Relationnelles + 11 Index")]
+  end
 
-  MW_Sec --> Svc_Crypto
-  MW_Sec --> Svc_Domain
-  Svc_Domain --> DB_Catalog
-  Svc_Domain --> DB_Orders
-  Svc_Domain --> DB_Coupons
-  Svc_Domain --> DB_Webhooks
-  Svc_Domain --> DB_Audit
+  Storefront & CartUI & PortalUI & AdminUI <-->|"HTTPS / JSON"| Headers
+  Headers --> ZodVal
+  ZodVal --> Pricing & CheckoutTx & WebhookTx
+  Pricing & CheckoutTx & WebhookTx <-->|"Prepared Statements / ACID"| SQLite
 ```
 
-### 2.2 Séquence Checkout, Réservation de Stock & Webhook Signé Idempotent
+### 2.2 Séquence Critique : Checkout Atomique & Webhook de Paiement Idempotent
 
 ```mermaid
 sequenceDiagram
   autonumber
-  actor Acheteur
-  participant API as API Serveur (/api/*)
-  participant DB as SQLite (Transactions ACID)
-  participant Gateway as Prestataire Paiement Sandbox
+  actor Client as Client (Navigateur)
+  participant API as API Express (/api/*)
+  participant Domain as EcommerceService (Transaction ACID)
+  participant DB as SQLite 3 (WAL)
+  participant Gateway as Prestataire Paiement (Webhook)
 
-  Acheteur->>API: POST /api/cart/quote { items: [{variantId, qty}], couponCode }
-  API->>DB: Lecture price_cents, stock, règles coupon
-  API-->>Acheteur: Quote serveur (subtotal, discount, shipping, TVA, total)
+  Client->>API: POST /api/cart/quote (items, couponCode, deliveryMode)
+  API->>Domain: calculateCartPricing()
+  Domain->>DB: SELECT price_cents, stock FROM product_variants + coupons
+  Domain-->>Client: 200 OK (Devis recalculé serveur)
 
-  Acheteur->>API: POST /api/checkout { items, couponCode, adresse, idempotencyKey }
-  API->>DB: BEGIN IMMEDIATE TRANSACTION
-  DB->>DB: Vérifie idempotency_key (retourne commande existante si rejeu)
-  DB->>DB: Recalcule prix serveur + UPDATE product_variants SET stock = stock - qty WHERE stock >= qty
-  DB->>DB: INSERT orders (status='pending_payment', stock_deducted=1) & order_items
-  DB->>DB: INSERT simulated_emails & audit_logs
-  API->>DB: COMMIT
-  API-->>Acheteur: 201 Created { order, paymentIntentId }
+  Client->>API: POST /api/checkout (items, adresse Afrique, paymentMethod, idempotencyKey)
+  API->>Domain: createCheckoutOrder() [BEGIN IMMEDIATE TRANSACTION]
+  Domain->>DB: Vérifie idempotency_key UNIQUE
+  Domain->>DB: UPDATE product_variants SET stock = stock - qty WHERE stock >= qty
+  Domain->>DB: INSERT INTO orders (status='pending_payment', stock_deducted=1)
+  Domain->>DB: INSERT INTO order_items + simulated_emails + audit_logs
+  Domain-->>Client: 201 Created (Certificat de Commande + Réf. Transaction)
 
-  Gateway->>API: POST /api/webhooks/payment (Header: X-Webhook-Signature: t=...,v1=HMAC)
-  API->>API: Vérifie HMAC-SHA256 (timingSafeEqual) + fenêtre anti-rejeu (300s)
-  API->>DB: BEGIN TRANSACTION
-  DB->>DB: SELECT webhook_events WHERE event_id = ? (Court-circuite si déjà traité)
-  alt payment_intent.succeeded
-    DB->>DB: UPDATE orders SET status='paid'
-    DB->>DB: INSERT simulated_emails (Facture acquittée)
-  else payment_intent.payment_failed
-    DB->>DB: UPDATE orders SET status='payment_failed', stock_deducted=0
-    DB->>DB: UPDATE product_variants SET stock = stock + qty (Restitution atomique)
+  Gateway->>API: POST /api/webhooks/payment (X-Webhook-Signature: t=...,v1=...)
+  API->>Domain: processPaymentWebhook(rawBody, signatureHeader)
+  Domain->>Domain: verifyWebhookSignature() [HMAC-SHA256 + timingSafeEqual + <=300s]
+  Domain->>DB: SELECT FROM webhook_events WHERE event_id = ? (Idempotence)
+  alt Paiement Confirmé (payment_intent.succeeded)
+    Domain->>DB: UPDATE orders SET status = 'paid'
+    Domain->>DB: INSERT INTO webhook_events & simulated_emails (Reçu)
+  else Échec ou Annulation (payment_intent.payment_failed / order.cancelled)
+    Domain->>DB: UPDATE product_variants SET stock = stock + qty (Restitution atomique)
+    Domain->>DB: UPDATE orders SET status = 'payment_failed', stock_deducted = 0
   end
-  DB->>DB: INSERT webhook_events (event_id UNIQUE) & audit_logs
-  API->>DB: COMMIT
-  API-->>Gateway: 200 OK { status, idempotentReplay: false }
+  Domain-->>Gateway: 200 OK (status, idempotentReplay)
 ```
 
 ---
 
-## 3. Modèle de Données Relationnel
+## 3. Schéma de Données Relationnel & Stratégie d'Indexation
 
-| Table | Clé Primaire / Contraintes Uniques | Colonnes Clés & Règles d'Intégrité |
-| :--- | :--- | :--- |
-| `users` | `id` (PK), `email` (`UNIQUE`) | `name`, `password_hash` (PBKDF2-SHA512), `role` (`CHECK IN ('customer', 'admin')`) |
-| `sessions` | `token_hash` (PK HMAC-SHA256) | `user_id` (FK `users.id`), `expires_at` |
-| `products` | `id` (PK), `slug` (`UNIQUE`) | `title`, `category`, `subtitle`, `description`, `craftsmanship`, `dimensions`, `image_url`, `active` |
-| `product_variants` | `id` (PK), `sku` (`UNIQUE`) | `product_id` (FK), `name`, `finish`, `price_cents` (`>= 0`), `stock` (`CHECK (stock >= 0)`) |
-| `coupons` | `id` (PK), `code` (`UNIQUE`) | `discount_type` (`percentage` \| `fixed_cents`), `discount_value`, `min_subtotal_cents`, `max_uses`, `used_count`, `active`, `expires_at` |
-| `orders` | `id` (PK), `order_number` (`UNIQUE`), `payment_intent_id` (`UNIQUE`), `idempotency_key` (`UNIQUE`) | `user_id`, `customer_email`, `subtotal_cents`, `discount_cents`, `shipping_cents`, `tax_cents`, `total_cents`, `status`, `stock_deducted` (`0` ou `1`) |
-| `order_items` | `id` (PK) | `order_id` (FK), `product_id`, `variant_id`, `sku`, `unit_price_cents`, `quantity`, `line_total_cents` |
-| `webhook_events` | `id` (PK), `event_id` (`UNIQUE`) | `event_type`, `payment_intent_id`, `order_id`, `signature_valid`, `status`, `payload_json`, `processed_at` |
-| `simulated_emails` | `id` (PK) | `order_id`, `recipient_email`, `subject`, `template_name`, `body_text`, `sent_at` |
-| `audit_logs` | `id` (PK) | `actor_user_id`, `actor_email`, `action`, `target_type`, `target_id`, `details_json`, `ip_address`, `created_at` |
+### 3.1 Tables Principales (9 Tables)
+1. **`users`** : Comptes clients et administrateurs (`id`, `email UNIQUE`, `name`, `password_hash`, `role CHECK('customer','admin')`).
+2. **`sessions`** : Sessions actives (`token_hash PRIMARY KEY`, `user_id FK`, `expires_at`).
+3. **`products`** : Catalogue des pièces architecturales (`id`, `slug UNIQUE`, `title`, `category`, `craftsmanship`, `dimensions`, `image_url`, `active`).
+4. **`product_variants`** : Variantes et stocks (`id`, `product_id FK`, `sku UNIQUE`, `name`, `finish`, `price_cents CHECK(>=0)`, `stock CHECK(>=0)`).
+5. **`coupons`** : Codes privilèges (`id`, `code UNIQUE`, `discount_type`, `discount_value`, `min_subtotal_cents`, `max_uses`, `used_count`, `active`, `expires_at`).
+6. **`orders`** : Commandes avec coordonnées complètes (`id`, `order_number UNIQUE`, `user_id FK`, `customer_email`, `customer_phone`, `shipping_address`, `shipping_city`, `shipping_country`, `landmark`, `delivery_mode`, `payment_method`, `subtotal_cents`, `discount_cents`, `shipping_cents`, `tax_cents`, `total_cents`, `status`, `payment_intent_id UNIQUE`, `idempotency_key UNIQUE`, `stock_deducted`).
+7. **`order_items`** : Lignes de commande figées au tarif du jour (`order_id FK`, `variant_id FK`, `sku`, `unit_price_cents`, `quantity`, `line_total_cents`).
+8. **`webhook_events`** : Registre d'idempotence des webhooks (`event_id UNIQUE`, `event_type`, `payment_intent_id`, `order_id FK`, `signature_valid`, `status`, `payload_json`).
+9. **`simulated_emails` & `audit_logs`** : Traçabilité des courriers envoyés aux clients et journal d'audit sécurité immuable.
 
----
-
-## 4. Contrats d'API & Matrice des Permissions (RBAC)
-
-| Méthode & Route | Permission | Description & Garanties |
-| :--- | :--- | :--- |
-| `GET /api/catalog` | Public | Liste les produits actifs et leurs variantes (prix unitaire en centimes et stock). |
-| `POST /api/cart/quote` | Public | Recalcule côté serveur le panier (`items`, `couponCode`) : sous-total, remise, livraison (offerte dès 500 €), TVA 20%, total TTC. |
-| `POST /api/checkout` | Public / Client | Crée une commande dans une transaction ACID avec réservation de stock et clé d'idempotence (`idempotencyKey`). Rate-limited. |
-| `POST /api/webhooks/payment` | Prestataire (HMAC) | Réceptionne les webhooks signés via l'en-tête `X-Webhook-Signature: t=...,v1=...`. Idempotent via `event_id`. |
-| `POST /api/payments/sandbox-simulate` | Sandbox Test | Génère et expédie un événement webhook signé (ou volontairement altéré) vers le moteur de traitement. |
-| `POST /api/auth/register` | Public | Crée un compte `customer`, hache le mot de passe, génère un email de bienvenue simulé. |
-| `POST /api/auth/login` | Public | Authentifie un utilisateur et retourne un jeton Bearer dont seul le condensat HMAC est stocké en base. |
-| `GET /api/orders/my` | Authentifié (`requireAuth`) | Retourne les commandes et emails simulés appartenant exclusivement à l'utilisateur connecté. |
-| `GET /api/orders/:id` | Propriétaire / Admin / Token PI | Retourne le détail d'une commande et ses emails associés. |
-| `GET /api/admin/overview` | Admin (`requireAdmin`) | Retourne stocks, commandes globales, coupons, webhooks, emails simulés et `audit_logs`. |
-| `PATCH /api/admin/variants/:id` | Admin (`requireAdmin`) | Met à jour le stock et le prix d'une variante avec journalisation d'audit. |
-| `PATCH /api/admin/orders/:id/status` | Admin (`requireAdmin`) | Change le statut d'une commande et restitue/réserve automatiquement le stock selon la transition. |
-| `POST /api/admin/coupons` | Admin (`requireAdmin`) | Crée un nouveau code promotionnel validé par schéma Zod. |
-| `PATCH /api/admin/coupons/:id` | Admin (`requireAdmin`) | Active ou désactive un code promotionnel. |
+### 3.2 Index Secondaires Déployés (Zéro Full-Table Scan)
+- `idx_sessions_user_id` & `idx_sessions_expires_at` : Validation et purge rapide des sessions.
+- `idx_variants_product_id` : Chargement instantané des variantes du catalogue.
+- `idx_orders_user_id`, `idx_orders_customer_email`, `idx_orders_status` : Recherche client et filtrage direction.
+- `idx_order_items_order_id` : Chargement groupé (*Batch Loading* sans requête $N+1$) des lignes de commandes.
+- `idx_webhook_events_order_id`, `idx_simulated_emails_recipient`, `idx_simulated_emails_order_id`, `idx_audit_logs_created_at`.
 
 ---
 
-## 5. Analyse des Risques (Sécurité, Confidentialité, Coûts & Dépendances)
+## 4. Contrats d'API REST & Modèle de Permissions (RBAC)
 
-1. **Manipulation des prix ou remises côté client** :
-   - *Mitigation* : `calculateCartPricing` n'accepte que `{ variantId, quantity }` et `couponCode`. Tout champ `priceCents` injecté dans le JSON client est ignoré par Zod et recalculé depuis `product_variants`.
-2. **Falsification ou rejeu de Webhooks de paiement** :
-   - *Mitigation* : Vérification HMAC-SHA256 sur le corps brut (`req.rawBody`) via `crypto.timingSafeEqual`, fenêtre d'horodatage de 300 secondes et contrainte `UNIQUE` sur `webhook_events.event_id`.
-3. **Concurrence et survente de stock (*Race Conditions*)** :
-   - *Mitigation* : Décrémentation conditionnelle `UPDATE product_variants SET stock = stock - ? WHERE id = ? AND stock >= ?` exécutée au sein d'une transaction SQLite atomique. Si `res.changes !== 1`, la transaction entière est annulée (`ROLLBACK`).
-4. **Protection des secrets et données personnelles (RGPD)** :
-   - *Mitigation* : Aucun secret réel dans le dépôt (`.env.example` documenté). Mots de passe salés et hachés avec PBKDF2-SHA512 (100 000 itérations). Jetons de session hachés en base. Données pré-remplies 100% synthétiques (`.test`).
+| Méthode & Route | Accès / Rôle | Description & Garanties |
+| :--- | :--- | :--- |
+| `GET /api/health` | Public (Sonde) | Vérifie la connexion SQLite et retourne l'état de santé (`status: 'ok'`). |
+| `GET /api/catalog` | Public | Liste les pièces actives et leurs variantes avec stock temps réel. |
+| `POST /api/cart/quote` | Public | Recalcule intégralement le panier côté serveur (sous-total, code privilège, livraison, TVA). |
+| `POST /api/checkout` | Public / Client | Crée une commande de manière transactionnelle et idempotente avec réservation atomique du stock. |
+| `GET /api/orders/track` | Public (Vérifié) | Suivi direct par `orderNumber` + vérification de correspondance `contact` (téléphone ou email). |
+| `GET /api/orders/:id` | Propriétaire / Admin | Détail d'une commande et de ses courriers (protégé par propriété ou jeton de transaction). |
+| `POST /api/webhooks/payment` | Passerelle (HMAC) | Réception de webhook signé `X-Webhook-Signature` (`HMAC-SHA256`) et idempotent. |
+| `POST /api/auth/register` | Public (Rate-Limited) | Création d'un compte client (`PBKDF2-SHA512`) et ouverture de session. |
+| `POST /api/auth/login` | Public (Rate-Limited) | Authentification et émission d'un jeton Bearer. |
+| `GET /api/orders/my` | Client (`requireAuth`) | Historique des commandes et courriers du membre connecté. |
+| `GET /api/admin/overview` | Admin (`requireAdmin`) | Vue consolidée de direction (stocks, commandes, codes privilèges, audit). |
+| `PATCH /api/admin/variants/:id` | Admin (`requireAdmin`) | Ajustement du stock et du prix d'une variante avec traçabilité dans `audit_logs`. |
+| `PATCH /api/admin/orders/:id/status` | Admin (`requireAdmin`) | Changement de statut d'une commande avec restitution/réservation automatique du stock. |
+| `POST /api/admin/coupons` | Admin (`requireAdmin`) | Création d'un nouveau code privilège. |
+
+---
+
+## 5. Matrice de Sécurité & Conformité Internationale (OWASP ASVS)
+
+1. **Intégrité Financière** : Aucun prix ni taux de remise n'est accepté depuis le client. Toute divergence est ignorée et recalculée par `EcommerceService.calculateCartPricing`.
+2. **Protection contre les Conditions de Course (Race Conditions)** : L'instruction SQL `UPDATE product_variants SET stock = stock - ? WHERE id = ? AND stock >= ?` exécutée dans une transaction SQLite sérialisée garantit qu'un stock ne peut jamais devenir négatif, même sous forte concurrence.
+3. **Protection contre la Falsification et le Rejeu de Webhooks** :
+   - Signature `HMAC-SHA256` sur `${timestamp}.${rawBody}`.
+   - Comparaison en temps constant (`crypto.timingSafeEqual`).
+   - Rejet automatique si `|now - timestamp| > 300s`.
+   - Unicité stricte sur `webhook_events.event_id`.
+4. **Traçabilité & Diagnostic (`X-Request-Id`)** : Chaque réponse HTTP et chaque message d'erreur JSON comporte un identifiant unique `X-Request-Id` facilitant l'audit et le support.

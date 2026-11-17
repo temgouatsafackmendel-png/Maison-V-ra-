@@ -1,6 +1,6 @@
 {
   "name": "Maison Véra — Boutique E-Commerce Architecturale",
-  "description": "Boutique en ligne complète d'objets architecturaux, luminaires et acoustique avec gestion des variantes, stocks transactionnels, recalcul serveur des prix, coupons, webhooks signés idempotents, emails simulés et administration.",
+  "description": "Maison Véra — Collection exclusive de luminaires en albâtre, mobilier en bois précieux et acoustique haute-fidélité. Commande en ligne en FCFA (XAF/XOF) et Euro, règlement Mobile Money (MTN MoMo, Orange Money, Wave) et livraison sur mesure.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -19,7 +19,31 @@ describe('Maison Véra Afrique E-Commerce — Tests Unitaires, Intégration & Pa
     app = created.app;
   });
 
-  describe('1. Sécurité Cryptographique (Mots de passe & Signatures HMAC Webhook)', () => {
+  describe('1. Observabilité, En-têtes de Sécurité Internationaux & Sondes de Santé', () => {
+    it('expose GET /api/health, propage X-Request-Id et applique les en-têtes de sécurité OWASP', async () => {
+      const res = await request(app)
+        .get('/api/health')
+        .set('X-Request-Id', 'req_custom_trace_001');
+
+      expect(res.status).toBe(200);
+      expect(res.headers['x-request-id']).toBe('req_custom_trace_001');
+      expect(res.headers['x-content-type-options']).toBe('nosniff');
+      expect(res.headers['x-frame-options']).toBe('SAMEORIGIN');
+      expect(res.headers['referrer-policy']).toBe('strict-origin-when-cross-origin');
+      expect(res.body.status).toBe('ok');
+      expect(res.body.database).toBe('connected');
+      expect(res.body.activeProducts).toBeGreaterThanOrEqual(4);
+    });
+
+    it('retourne une erreur JSON structurée 404 ENDPOINT_NOT_FOUND sur une route /api/* inconnue', async () => {
+      const res = await request(app).get('/api/route-inexistante');
+      expect(res.status).toBe(404);
+      expect(res.body.code).toBe('ENDPOINT_NOT_FOUND');
+      expect(res.body.requestId).toBeDefined();
+    });
+  });
+
+  describe('2. Sécurité Cryptographique (Mots de passe & Signatures HMAC Webhook)', () => {
     it('hache et vérifie correctement un mot de passe avec PBKDF2-SHA512', () => {
       const hash = hashPassword('MonMotDePasseSecurise2026!');
       expect(hash).toContain(':');
@@ -68,8 +92,8 @@ describe('Maison Véra Afrique E-Commerce — Tests Unitaires, Intégration & Pa
     });
   });
 
-  describe('2. Critère d’Acceptation #1 : Recalcul Serveur des Prix, Coupons & Frais de Port', () => {
-    it('ignore tout prix falsifié envoyé par le client et recalcule le total TTC depuis la base SQLite', async () => {
+  describe('3. Critère d’Acceptation #1 : Recalcul Serveur des Prix, Coupons Afrique & Frais de Port', () => {
+    it('ignore tout prix falsifié envoyé par le client et recalcule le total TTC depuis la base SQLite (BIENVENUE10, DAKAR25, VIP100)', async () => {
       // Variante #1 = MV-SOL-BRZ-S (680,00 € = 68000 centimes)
       // Variante #10 = MV-FOR-SET-ROM (240,00 € = 24000 centimes)
       const res = await request(app)
@@ -89,6 +113,28 @@ describe('Maison Véra Afrique E-Commerce — Tests Unitaires, Intégration & Pa
       expect(quote.shippingCents).toBe(0);
       expect(quote.totalCents).toBe(104400);
       expect(quote.appliedCoupon?.code).toBe('BIENVENUE10');
+
+      // Vérification du code DAKAR25 (-25% dès 600 €)
+      const resDakar = await request(app)
+        .post('/api/cart/quote')
+        .send({
+          items: [{ variantId: 1, quantity: 1 }], // 680,00 €
+          couponCode: 'DAKAR25',
+        });
+      expect(resDakar.status).toBe(200);
+      expect(resDakar.body.quote.discountCents).toBe(17000); // 25% de 680 € = 170 €
+      expect(resDakar.body.quote.totalCents).toBe(51000);
+
+      // Vérification du code VIP100 (-100 € dès 1000 €)
+      const resVip = await request(app)
+        .post('/api/cart/quote')
+        .send({
+          items: [{ variantId: 4, quantity: 1 }], // Fauteuil Arceau 1 450,00 €
+          couponCode: 'VIP100',
+        });
+      expect(resVip.status).toBe(200);
+      expect(resVip.body.quote.discountCents).toBe(10000);
+      expect(resVip.body.quote.totalCents).toBe(135000);
     });
 
     it('applique les frais de port (25,00 €) sous le seuil de 500,00 €, gère le retrait gratuit en showroom Afrique et rejette les coupons expirés', async () => {
@@ -132,8 +178,8 @@ describe('Maison Véra Afrique E-Commerce — Tests Unitaires, Intégration & Pa
     });
   });
 
-  describe('3. Critères d’Acceptation #2 & #3 : Checkout Mobile Money Afrique, Stocks Cohérents, Suivi & Webhooks Signés/Idempotents', () => {
-    it('réserve le stock au checkout avec adresse Afrique (Quartier/Repère/Mobile Money), génère le push SMS/WhatsApp et valide le suivi et webhook idempotent', async () => {
+  describe('4. Critères d’Acceptation #2 & #3 : Checkout Mobile Money Afrique, Stocks Cohérents, Suivi & Webhooks Signés/Idempotents', () => {
+    it('réserve le stock au checkout avec adresse Afrique (Quartier/Repère/Mobile Money), protège le suivi et valide le webhook idempotent', async () => {
       const catBefore = await request(app).get('/api/catalog');
       const v1Before = catBefore.body.products[0].variants.find(
         (v: { id: number }) => v.id === 1
@@ -162,7 +208,6 @@ describe('Maison Véra Afrique E-Commerce — Tests Unitaires, Intégration & Pa
       expect(chkRes.status).toBe(201);
       expect(chkRes.body.idempotentReplay).toBe(false);
       const order = chkRes.body.order;
-      // 2 * 68000 = 136000 - 15% (20400) = 115600
       expect(order.subtotalCents).toBe(136000);
       expect(order.discountCents).toBe(20400);
       expect(order.totalCents).toBe(115600);
@@ -176,11 +221,17 @@ describe('Maison Véra Afrique E-Commerce — Tests Unitaires, Intégration & Pa
         .query({ orderNumber: order.orderNumber, contact: '+237 699 45 12 88' });
       expect(trackRes.status).toBe(200);
       expect(trackRes.body.order.orderNumber).toBe(order.orderNumber);
-      // Vérifie que l'email ET le push SMS/WhatsApp USSD (*126#) ont bien été générés
       expect(trackRes.body.emails.length).toBeGreaterThanOrEqual(2);
       expect(
         trackRes.body.emails.some((e: { bodyText: string }) => e.bodyText.includes('*126#'))
       ).toBe(true);
+
+      // Vérifier le rejet 403 si un tiers tente de suivre la commande avec un mauvais téléphone/email
+      const trackWrongContact = await request(app)
+        .get('/api/orders/track')
+        .query({ orderNumber: order.orderNumber, contact: 'intrus@example.test' });
+      expect(trackWrongContact.status).toBe(403);
+      expect(trackWrongContact.body.code).toBe('ORDER_CONTACT_MISMATCH');
 
       // Rejouer exactement le même checkout (même idempotencyKey) -> 200 OK sans redéduire le stock
       const chkReplay = await request(app).post('/api/checkout').send(checkoutPayload);
@@ -301,7 +352,7 @@ describe('Maison Véra Afrique E-Commerce — Tests Unitaires, Intégration & Pa
     });
   });
 
-  describe('4. Comptes, Permissions RBAC, Emails Simulés & Administration', () => {
+  describe('5. Comptes, Permissions RBAC, Emails Simulés & Administration', () => {
     it('bloque l’accès aux routes /api/admin/* pour un client standard (403) et autorise l’administrateur', async () => {
       const customerLogin = await request(app).post('/api/auth/login').send({
         email: 'claire.moreau@example.test',

@@ -5,6 +5,23 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
 Le format est basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/),
 et ce projet adhère au [Semantic Versioning (SemVer)](https://semver.org/lang/fr/).
 
+## [1.1.0] - 2026-11-17
+
+### Ajouté (Added)
+- **Certificat d'Acquisition & Facture Officielle Téléchargeable (`OrderSandboxModal.tsx`)** :
+  - **Frise visuelle de progression en 4 étapes** (*1. Enregistrée → 2. Règlement validé → 3. Atelier → 4. Expédition*).
+  - **Téléchargement en 1 clic du Certificat & Facture Officielle (`.txt`)** avec détail complet en double devise (`FCFA` + `EUR`), TVA, point de repère et numéro de transaction.
+- **Portail de Direction Enrichi (`AdminDashboard.tsx`)** :
+  - **Synchronisation Multi-Devises (`XAF`, `XOF`, `EUR`)** sur l'ensemble des indicateurs clés de performance (Chiffre d'affaires confirmé, tarifs des variantes, seuils des coupons).
+  - **Export Comptable CSV (`Exporter CSV Comptable`)** générant un fichier `.csv` encodé UTF-8 BOM compatible Excel de toutes les commandes filtrées.
+  - **Recherche instantanée & filtrage par statut** dans le registre des commandes (par référence, client, ville ou téléphone WhatsApp).
+- **Carnet de Souhaits / Favoris (`src/App.tsx`)** :
+  - Sélection de pièces favorites (`♥`) directement sur chaque carte du catalogue et filtre dédié **« Favoris »** dans la barre des collections.
+- **Architecture & Observabilité Cloud-Native** :
+  - Sonde de santé `GET /api/health`, corrélation distribuée `X-Request-Id`, indexation relationnelle SQLite (11 index secondaires) et chargement groupé des lignes de commandes sans requête $N+1$.
+
+---
+
 ## [1.0.0] - 2026-11-17
 
 ### Ajouté (Added)
@@ -16,12 +33,6 @@ et ce projet adhère au [Semantic Versioning (SemVer)](https://semver.org/lang/f
   - **Mode Éco Data (3G/4G)** pour optimiser l'expérience sur réseaux mobiles.
   - **Suivi Direct de Commande** sans création de compte obligatoire (via numéro de commande + WhatsApp ou e-mail) et export du bon de commande pour WhatsApp en 1 clic.
 - **Moteur Transactionnel & Sécurité Serveur** :
-  - Recalcul intégral des prix, remises (`BIENVENUE10`, `DAKAR25`, `VIP100`, `ARCHITECTE15`, `ATELIER50`), frais de livraison et TVA exclusivement côté serveur (`POST /api/cart/quote` et `POST /api/checkout`).
+  - Recalcul intégral des prix, remises (`BIENVENUE10`, `DAKAR25`, `VIP100`, `AFRIQUE10`, `MOMO15`, `ARCHITECTE15`, `ATELIER50`), frais de livraison et TVA exclusivement côté serveur (`POST /api/cart/quote` et `POST /api/checkout`).
   - Réservation atomique des stocks en base SQLite WAL et restitution automatique en cas d'annulation ou d'échec de paiement.
   - Webhooks de paiement signés `HMAC-SHA256` en temps constant (`crypto.timingSafeEqual`) avec protection anti-rejeu et idempotence stricte (`webhook_events.event_id UNIQUE`).
-- **Cercle Privé & Portail de Direction (Back-Office)** :
-  - Authentification sécurisée (`PBKDF2-SHA512` + jetons Bearer hachés) et contrôle d'accès par rôle (`customer` / `admin`).
-  - Pilotage des stocks par variante, gestion du statut d'expédition des commandes, création de codes privilèges et suivi des courriers transactionnels envoyés aux clients.
-- **Qualité, Conteneurisation & CI/CD** :
-  - Suite de tests automatisés Vitest + Supertest couvrant la cryptographie, le recalcul serveur des prix, la cohérence des stocks, l'idempotence des webhooks et le RBAC.
-  - `Dockerfile`, `.dockerignore`, `docker-compose.yml` et pipeline GitHub Actions (`.github/workflows/ci.yml`).

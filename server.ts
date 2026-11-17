@@ -22,15 +22,37 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
+    app.use(
+      express.static(distPath, {
+        maxAge: '1d',
+        index: false,
+      })
+    );
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  app.listen(port, '0.0.0.0', () => {
+  const server = app.listen(port, '0.0.0.0', () => {
     console.log(`Maison Véra E-Commerce server running on http://0.0.0.0:${port}`);
   });
+
+  // Graceful shutdown for container orchestrators (Docker, Cloud Run, Kubernetes)
+  const shutdown = (signal: string) => {
+    console.log(`Received ${signal}. Closing HTTP server and checkpointing SQLite WAL...`);
+    server.close(() => {
+      try {
+        db.pragma('wal_checkpoint(TRUNCATE)');
+        db.close();
+      } catch (err) {
+        console.error('Error closing SQLite database during shutdown:', err);
+      }
+      process.exit(0);
+    });
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 startServer().catch((err) => {

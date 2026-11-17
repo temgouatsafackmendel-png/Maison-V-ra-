@@ -1,7 +1,7 @@
 {
   "name": "maison-vera-ecommerce",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Maison Véra — Full-Stack Luxury Architectural E-Commerce Platform (Africa & International Edition: XAF/XOF/EUR, Mobile Money, Server-Side Pricing, Signed Idempotent Webhooks, ACID Stock)",
   "license": "MIT",
   "type": "module",

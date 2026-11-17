@@ -159,6 +159,19 @@ export function runMigrations(db: DBInstance): void {
       ip_address TEXT NOT NULL DEFAULT '127.0.0.1',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    -- Secondary Indexes for High-Performance Relational Lookups
+    CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_variants_product_id ON product_variants(product_id);
+    CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
+    CREATE INDEX IF NOT EXISTS idx_orders_customer_email ON orders(customer_email);
+    CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+    CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);
+    CREATE INDEX IF NOT EXISTS idx_webhook_events_order_id ON webhook_events(order_id);
+    CREATE INDEX IF NOT EXISTS idx_simulated_emails_recipient ON simulated_emails(recipient_email);
+    CREATE INDEX IF NOT EXISTS idx_simulated_emails_order_id ON simulated_emails(order_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
   `);
 
   // Safe incremental schema upgrade for existing SQLite files
@@ -250,7 +263,7 @@ export function seedDatabaseIfEmpty(db: DBInstance): void {
       );
       const p2Id = Number(p2.lastInsertRowid);
       insertVariant.run(p2Id, 'MV-ARC-OAK-ECR', 'Bois Fumé & Bouclé Écru', 'Essence tourbe & Coton bouclé naturel', 145000, 5);
-      insertVariant.run(p2Id, 'MV-ARC-OAK- Lin', 'Iroko Blond & Lin Lourd Craie', 'Iroko naturel & Lin respirant', 138000, 7);
+      insertVariant.run(p2Id, 'MV-ARC-OAK-LIN', 'Iroko Blond & Lin Lourd Craie', 'Iroko naturel & Lin respirant', 138000, 7);
       insertVariant.run(p2Id, 'MV-ARC-WAL-COG', 'Ébène & Cuir Sellerie', 'Bois sombre huilé & Cuir végétal Cognac', 189000, 2);
 
       // Product 3: Enceinte Acoustique Aeon
@@ -304,6 +317,26 @@ export function seedDatabaseIfEmpty(db: DBInstance): void {
     10,
     10000,
     500,
+    1,
+    '2028-12-31T23:59:59Z'
+  );
+  insertCouponIfNotExists.run(
+    'DAKAR25',
+    'Privilège Inauguration Galeries Dakar, Abidjan & Douala (-25% dès 600 €)',
+    'percentage',
+    25,
+    60000,
+    250,
+    1,
+    '2028-12-31T23:59:59Z'
+  );
+  insertCouponIfNotExists.run(
+    'VIP100',
+    'Invitation Cercle Privé Maison Véra (-100 € / ~65 600 FCFA dès 1 000 €)',
+    'fixed_cents',
+    10000,
+    100000,
+    150,
     1,
     '2028-12-31T23:59:59Z'
   );

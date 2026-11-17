@@ -891,7 +891,7 @@ export class EcommerceService {
       )
       .all(user.id, user.email) as Array<Record<string, unknown>>;
 
-    return rows.map((r) => this.mapOrderRow(r));
+    return this.mapOrderRows(rows);
   }
 
   public listAllOrders(): OrderDTO[] {
@@ -899,7 +899,7 @@ export class EcommerceService {
       .prepare(`SELECT * FROM orders ORDER BY id DESC LIMIT 100`)
       .all() as Array<Record<string, unknown>>;
 
-    return rows.map((r) => this.mapOrderRow(r));
+    return this.mapOrderRows(rows);
   }
 
   public updateOrderStatusAsAdmin(
@@ -1007,7 +1007,7 @@ export class EcommerceService {
     return this.getOrderById(orderId);
   }
 
-  private mapOrderRow(row: Record<string, unknown>): OrderDTO {
+  private mapOrderRow(row: Record<string, unknown>, preloadedItems?: OrderItemDTO[]): OrderDTO {
     const orderId = Number(row.id);
     return {
       id: orderId,
@@ -1035,8 +1035,48 @@ export class EcommerceService {
       idempotencyKey: String(row.idempotency_key),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
-      items: this.getOrderItems(orderId),
+      items: preloadedItems ?? this.getOrderItems(orderId),
     };
+  }
+
+  private mapOrderRows(rows: Array<Record<string, unknown>>): OrderDTO[] {
+    if (rows.length === 0) return [];
+    const orderIds = rows.map((r) => Number(r.id));
+    const placeholders = orderIds.map(() => '?').join(', ');
+    const itemRows = this.db
+      .prepare(
+        `SELECT * FROM order_items WHERE order_id IN (${placeholders}) ORDER BY id ASC`
+      )
+      .all(...orderIds) as Array<Record<string, unknown>>;
+
+    const itemsByOrder = new Map<number, OrderItemDTO[]>();
+    for (const r of itemRows) {
+      const orderId = Number(r.order_id);
+      const list = itemsByOrder.get(orderId) || [];
+      list.push({
+        id: Number(r.id),
+        productId: Number(r.product_id),
+        variantId: Number(r.variant_id),
+        sku: String(r.sku),
+        productTitle: String(r.product_title),
+        variantName: String(r.variant_name),
+        unitPriceCents: Number(r.unit_price_cents),
+        quantity: Number(r.quantity),
+        lineTotalCents: Number(r.line_total_cents),
+      });
+      itemsByOrder.set(orderId, list);
+    }
+
+    return rows.map((row) =>
+      this.mapOrderRow(row, itemsByOrder.get(Number(row.id)) || [])
+    );
+  }
+
+  public checkDatabaseHealth(): { ok: boolean; activeProducts: number } {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) as count FROM products WHERE active = 1`)
+      .get() as { count: number };
+    return { ok: true, activeProducts: Number(row.count) };
   }
 
   // --- Accounts & Sessions ---

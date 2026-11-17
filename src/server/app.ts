@@ -18,36 +18,62 @@ import type { OrderStatus, UserProfile } from '../shared/types.ts';
 export interface AuthenticatedRequest extends Request {
   user?: UserProfile | null;
   rawBody?: string;
+  requestId?: string;
 }
 
 export function createApiApp(db: DBInstance) {
   const app = express();
   const service = new EcommerceService(db);
 
-  // Basic security headers
-  app.use((_req, res, next) => {
+  app.disable('x-powered-by');
+
+  // International HTTP Security Headers & Request Correlation ID
+  app.use((req: AuthenticatedRequest, res, next) => {
+    const incomingReqId = req.headers['x-request-id'];
+    const requestId =
+      typeof incomingReqId === 'string' && incomingReqId.trim().length > 0
+        ? incomingReqId.trim().slice(0, 64)
+        : `req_${crypto.randomBytes(8).toString('hex')}`;
+
+    req.requestId = requestId;
+    res.setHeader('X-Request-Id', requestId);
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
     res.setHeader('X-XSS-Protection', '1; mode=block');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader(
+      'Permissions-Policy',
+      'camera=(), microphone=(), geolocation=(), payment=()'
+    );
     next();
   });
 
-  // Simple in-memory rate limiter for auth & checkout mutations
+  // Memory-safe in-memory rate limiter for auth & checkout mutations
   const rateBuckets = new Map<string, { count: number; resetAt: number }>();
   const rateLimit = (maxRequests: number, windowMs: number) => {
-    return (req: Request, res: Response, next: NextFunction) => {
+    return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+      const now = Date.now();
+      // Periodic cleanup of expired buckets to prevent memory growth
+      if (rateBuckets.size > 1000) {
+        for (const [k, v] of rateBuckets.entries()) {
+          if (now > v.resetAt) rateBuckets.delete(k);
+        }
+      }
+
       const ip = req.ip || '127.0.0.1';
       const key = `${ip}:${req.baseUrl}${req.path}`;
-      const now = Date.now();
       const bucket = rateBuckets.get(key);
       if (!bucket || now > bucket.resetAt) {
         rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
         return next();
       }
       if (bucket.count >= maxRequests) {
+        const retryAfterSec = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+        res.setHeader('Retry-After', String(retryAfterSec));
         return res.status(429).json({
           error: 'Trop de requêtes. Veuillez patienter quelques instants.',
           code: 'RATE_LIMIT_EXCEEDED',
+          requestId: req.requestId,
         });
       }
       bucket.count += 1;
@@ -82,6 +108,7 @@ export function createApiApp(db: DBInstance) {
       return res.status(401).json({
         error: 'Authentification requise pour accéder à cette ressource.',
         code: 'UNAUTHORIZED',
+        requestId: req.requestId,
       });
     }
     next();
@@ -92,6 +119,7 @@ export function createApiApp(db: DBInstance) {
       return res.status(401).json({
         error: 'Authentification requise.',
         code: 'UNAUTHORIZED',
+        requestId: req.requestId,
       });
     }
     if (req.user.role !== 'admin') {
@@ -101,16 +129,34 @@ export function createApiApp(db: DBInstance) {
         action: 'FORBIDDEN_ADMIN_ACCESS_ATTEMPT',
         targetType: 'endpoint',
         targetId: req.originalUrl,
-        details: { method: req.method },
+        details: { method: req.method, requestId: req.requestId },
         ipAddress: req.ip,
       });
       return res.status(403).json({
         error: 'Accès refusé : privilèges administrateur requis.',
         code: 'FORBIDDEN',
+        requestId: req.requestId,
       });
     }
     next();
   };
+
+  // --- Health & Readiness Probe (Cloud Run / Kubernetes / Docker) ---
+  app.get('/api/health', (_req, res, next) => {
+    try {
+      const health = service.checkDatabaseHealth();
+      res.status(200).json({
+        status: 'ok',
+        service: 'maison-vera-ecommerce',
+        version: '1.0.0',
+        database: health.ok ? 'connected' : 'degraded',
+        activeProducts: health.activeProducts,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
 
   // --- Public Catalog Endpoints ---
   app.get('/api/catalog', (_req, res, next) => {
@@ -299,6 +345,7 @@ export function createApiApp(db: DBInstance) {
         return res.status(403).json({
           error: 'Accès non autorisé à cette commande.',
           code: 'FORBIDDEN',
+          requestId: req.requestId,
         });
       }
 
@@ -414,12 +461,22 @@ export function createApiApp(db: DBInstance) {
     }
   );
 
+  // Unknown API Route Handler (Prevent falling through to HTML SPA for /api/*)
+  app.use('/api/*', (req: AuthenticatedRequest, res: Response) => {
+    res.status(404).json({
+      error: `Point de terminaison API introuvable : ${req.method} ${req.originalUrl}`,
+      code: 'ENDPOINT_NOT_FOUND',
+      requestId: req.requestId,
+    });
+  });
+
   // Centralized API Error Handler
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: unknown, req: AuthenticatedRequest, res: Response, _next: NextFunction) => {
     if (err instanceof DomainError) {
       return res.status(err.statusCode).json({
         error: err.message,
         code: err.code,
+        requestId: req.requestId,
       });
     }
     if (err instanceof ZodError) {
@@ -430,12 +487,14 @@ export function createApiApp(db: DBInstance) {
           : 'Données de requête invalides',
         code: 'VALIDATION_ERROR',
         issues: err.issues,
+        requestId: req.requestId,
       });
     }
     console.error('Unhandled API Error:', err);
     return res.status(500).json({
       error: 'Une erreur interne est survenue sur le serveur.',
       code: 'INTERNAL_SERVER_ERROR',
+      requestId: req.requestId,
     });
   });
 
