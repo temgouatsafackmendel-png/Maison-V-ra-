@@ -1,0 +1,6 @@
+{
+  "name": "Maison Véra — Boutique E-Commerce Architecturale",
+  "description": "Boutique en ligne complète d'objets architecturaux, luminaires et acoustique avec gestion des variantes, stocks transactionnels, recalcul serveur des prix, coupons, webhooks signés idempotents, emails simulés et administration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

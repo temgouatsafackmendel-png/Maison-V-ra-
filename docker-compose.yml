@@ -1,0 +1,17 @@
+services:
+  ecommerce:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - SQLITE_DB_PATH=/app/data/ecommerce.sqlite
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-whsec_sandbox_test_secret_change_in_prod}
+      - SESSION_SECRET=${SESSION_SECRET:-sess_sandbox_test_secret_change_in_prod}
+    volumes:
+      - ecommerce_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  ecommerce_data:

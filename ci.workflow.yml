@@ -1,0 +1,53 @@
+# GitHub Actions CI Workflow
+# Pour activer ce workflow sur GitHub, déplacez-le dans : .github/workflows/ci.yml
+name: CI — Maison Véra E-Commerce
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-and-tests:
+    name: Typecheck, Test & Production Build (Node 22 LTS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NODE_ENV: test
+      SQLITE_DB_PATH: ":memory:"
+      WEBHOOK_SECRET: "ci_webhook_secret_key_for_hmac_verification"
+      SESSION_SECRET: "ci_session_secret_key_for_token_hashing"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - name: Install dependencies cleanly
+        run: npm ci
+
+      - name: Verify strict TypeScript types (Lint)
+        run: npm run lint
+
+      - name: Run Unit, Integration & Critical Path Tests (Vitest)
+        run: npm test
+
+      - name: Build Production Frontend Bundle
+        run: npm run build
+
+      - name: Upload Production Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: maison-vera-dist
+          path: dist/
+          retention-days: 7
