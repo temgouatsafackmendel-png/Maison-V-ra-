@@ -9,12 +9,19 @@ import {
   verifyWebhookSignature,
 } from './security.ts';
 import { centsToFcfa } from '../utils/format.ts';
+import { buildCityRoutePlan, interpolateAlongRoute } from './geo.ts';
 import type {
+  AppointmentStatus,
   AuditLogDTO,
   CartItemInput,
   CartQuote,
+  ConciergeAppointmentDTO,
   CouponDTO,
+  CourierTrackingDTO,
+  CourierTrackingStatus,
+  CourierWaypoint,
   DeliveryModeType,
+  InventoryAnalyticsDTO,
   OrderDTO,
   OrderItemDTO,
   OrderStatus,
@@ -22,8 +29,11 @@ import type {
   PricedCartItem,
   Product,
   ProductVariant,
+  RestockUrgency,
   SimulatedEmailDTO,
+  StockHistoryPointDTO,
   UserProfile,
+  VariantRestockPredictionDTO,
   WebhookEventDTO,
 } from '../shared/types.ts';
 
@@ -135,6 +145,31 @@ export const WebhookPayloadSchema = z.object({
     orderNumber: z.string().trim().optional(),
     failureReason: z.string().trim().optional(),
   }),
+});
+
+export const AdminCourierTrackingUpdateSchema = z.object({
+  status: z.enum(['awaiting_dispatch', 'en_route', 'arriving_soon', 'delivered']).optional(),
+  progressPct: z.number().int().min(0).max(100).optional(),
+  lastCheckpoint: z.string().trim().min(2).max(200).optional(),
+  courierName: z.string().trim().min(2).max(100).optional(),
+  courierPhone: z.string().trim().min(6).max(40).optional(),
+});
+
+export const ConciergeAppointmentSchema = z.object({
+  showroomCity: z.string().trim().min(2, 'Ville de galerie requise').max(80),
+  customerName: z.string().trim().min(2, 'Nom complet requis').max(120),
+  customerPhone: z
+    .string()
+    .trim()
+    .min(6, 'Numéro de téléphone / WhatsApp requis')
+    .max(40),
+  customerEmail: z.string().trim().email('Adresse email invalide').max(120),
+  preferredDate: z.string().trim().min(4, 'Date souhaitée requise').max(40),
+  projectNote: z.string().trim().max(500).default(''),
+});
+
+export const AppointmentStatusUpdateSchema = z.object({
+  status: z.enum(['pending', 'confirmed', 'completed', 'rescheduled']),
 });
 
 export class EcommerceService {
@@ -507,6 +542,11 @@ export class EcommerceService {
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
 
+      const insertStockMove = this.db.prepare(
+        `INSERT INTO stock_movements (variant_id, delta, reason, reference_id)
+         VALUES (?, ?, 'sale', ?)`
+      );
+
       for (const item of quote.items) {
         insertOrderItem.run(
           orderId,
@@ -519,7 +559,49 @@ export class EcommerceService {
           item.quantity,
           item.lineTotalCents
         );
+        insertStockMove.run(item.variantId, -item.quantity, orderNumber);
       }
+
+      // Initialize real-time courier GPS route plan for this order
+      const routePlan = buildCityRoutePlan({
+        shippingCity: input.shippingCity,
+        shippingCountry: input.shippingCountry,
+        shippingAddress: input.shippingAddress,
+        landmark: input.landmark,
+        seedOffset: orderId,
+      });
+      const initialTelemetry = interpolateAlongRoute(routePlan.waypoints, 0);
+
+      this.db
+        .prepare(
+          `INSERT INTO courier_tracking (
+             order_id, courier_name, courier_phone, vehicle_label, vehicle_plate, hub_name,
+             origin_lat, origin_lng, destination_lat, destination_lng,
+             current_lat, current_lng, heading_deg, speed_kmh, progress_pct,
+             eta_minutes, distance_remaining_km, total_distance_km, status, last_checkpoint, waypoints_json
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'awaiting_dispatch', ?, ?)`
+        )
+        .run(
+          orderId,
+          routePlan.courierName,
+          routePlan.courierPhone,
+          routePlan.vehicleLabel,
+          routePlan.vehiclePlate,
+          routePlan.hubName,
+          routePlan.originLat,
+          routePlan.originLng,
+          routePlan.destinationLat,
+          routePlan.destinationLng,
+          initialTelemetry.lat,
+          initialTelemetry.lng,
+          initialTelemetry.headingDeg,
+          initialTelemetry.speedKmh,
+          initialTelemetry.etaMinutes,
+          initialTelemetry.distanceRemainingKm,
+          initialTelemetry.totalDistanceKm,
+          initialTelemetry.lastCheckpoint,
+          JSON.stringify(routePlan.waypoints)
+        );
 
       const totalFcfa = new Intl.NumberFormat('fr-FR').format(
         centsToFcfa(quote.totalCents)
@@ -730,8 +812,13 @@ export class EcommerceService {
             const restoreStmt = this.db.prepare(
               `UPDATE product_variants SET stock = stock + ? WHERE id = ?`
             );
+            const restoreMoveStmt = this.db.prepare(
+              `INSERT INTO stock_movements (variant_id, delta, reason, reference_id)
+               VALUES (?, ?, 'cancel_restore', ?)`
+            );
             for (const item of items) {
               restoreStmt.run(item.quantity, item.variantId);
+              restoreMoveStmt.run(item.variantId, item.quantity, orderNumber);
             }
 
             if (couponCode) {
@@ -977,6 +1064,38 @@ export class EcommerceService {
       }
 
       if (newStatus === 'shipped') {
+        const tracking = this.ensureTrackingRow(orderId, row);
+        const waypoints = this.parseWaypoints(String(tracking.waypoints_json));
+        const nextProgress = Math.max(18, Number(tracking.progress_pct || 0));
+        const telemetry = interpolateAlongRoute(waypoints, nextProgress);
+        const trackingStatus: CourierTrackingStatus =
+          nextProgress >= 100
+            ? 'delivered'
+            : nextProgress >= 80
+              ? 'arriving_soon'
+              : 'en_route';
+
+        this.db
+          .prepare(
+            `UPDATE courier_tracking
+             SET progress_pct = ?, current_lat = ?, current_lng = ?, heading_deg = ?,
+                 speed_kmh = ?, eta_minutes = ?, distance_remaining_km = ?,
+                 status = ?, last_checkpoint = ?, updated_at = datetime('now')
+             WHERE order_id = ?`
+          )
+          .run(
+            nextProgress,
+            telemetry.lat,
+            telemetry.lng,
+            telemetry.headingDeg,
+            telemetry.speedKmh,
+            telemetry.etaMinutes,
+            telemetry.distanceRemainingKm,
+            trackingStatus,
+            telemetry.lastCheckpoint,
+            orderId
+          );
+
         this.sendSimulatedEmail({
           orderId,
           recipientEmail: customerEmail,
@@ -985,11 +1104,36 @@ export class EcommerceService {
           bodyText: [
             `Bonjour ${customerName},`,
             ``,
-            `Vos pièces de la commande ${orderNumber} ont quitté notre showroom et sont en route. Notre coursier vous appellera au ${customerPhone} à son arrivée au point de repère indiqué.`,
+            `Vos pièces de la commande ${orderNumber} ont quitté notre showroom et sont en route. Notre coursier vous appellera au ${customerPhone} à son arrivée au point de repère indiqué. Vous pouvez suivre sa position GPS en temps réel depuis votre espace client.`,
             ``,
             `Maison Véra — Douala · Abidjan · Dakar`,
           ].join('\n'),
         });
+      } else if (newStatus === 'cancelled' || newStatus === 'payment_failed') {
+        const existingTracking = this.db
+          .prepare(`SELECT waypoints_json FROM courier_tracking WHERE order_id = ?`)
+          .get(orderId) as { waypoints_json: string } | undefined;
+        if (existingTracking) {
+          const waypoints = this.parseWaypoints(existingTracking.waypoints_json);
+          const resetTelemetry = interpolateAlongRoute(waypoints, 0);
+          this.db
+            .prepare(
+              `UPDATE courier_tracking
+               SET progress_pct = 0, current_lat = ?, current_lng = ?, heading_deg = ?,
+                   speed_kmh = 0, eta_minutes = ?, distance_remaining_km = ?,
+                   status = 'awaiting_dispatch', last_checkpoint = ?, updated_at = datetime('now')
+               WHERE order_id = ?`
+            )
+            .run(
+              resetTelemetry.lat,
+              resetTelemetry.lng,
+              resetTelemetry.headingDeg,
+              resetTelemetry.etaMinutes,
+              resetTelemetry.distanceRemainingKm,
+              resetTelemetry.lastCheckpoint,
+              orderId
+            );
+        }
       }
 
       this.logAudit({
@@ -1007,8 +1151,315 @@ export class EcommerceService {
     return this.getOrderById(orderId);
   }
 
-  private mapOrderRow(row: Record<string, unknown>, preloadedItems?: OrderItemDTO[]): OrderDTO {
+  private parseWaypoints(rawJson: string): CourierWaypoint[] {
+    try {
+      const parsed = JSON.parse(rawJson);
+      return Array.isArray(parsed) ? (parsed as CourierWaypoint[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private mapTrackingRow(row: Record<string, unknown>): CourierTrackingDTO {
+    return {
+      orderId: Number(row.order_id),
+      courierName: String(row.courier_name),
+      courierPhone: String(row.courier_phone),
+      vehicleLabel: String(row.vehicle_label),
+      vehiclePlate: String(row.vehicle_plate),
+      hubName: String(row.hub_name),
+      originLat: Number(row.origin_lat),
+      originLng: Number(row.origin_lng),
+      destinationLat: Number(row.destination_lat),
+      destinationLng: Number(row.destination_lng),
+      currentLat: Number(row.current_lat),
+      currentLng: Number(row.current_lng),
+      headingDeg: Number(row.heading_deg),
+      speedKmh: Number(row.speed_kmh),
+      progressPct: Number(row.progress_pct),
+      etaMinutes: Number(row.eta_minutes),
+      distanceRemainingKm: Number(row.distance_remaining_km),
+      totalDistanceKm: Number(row.total_distance_km),
+      status: String(row.status) as CourierTrackingStatus,
+      lastCheckpoint: String(row.last_checkpoint),
+      waypoints: this.parseWaypoints(String(row.waypoints_json)),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  private ensureTrackingRow(
+    orderId: number,
+    orderRow?: Record<string, unknown>
+  ): Record<string, unknown> {
+    const existing = this.db
+      .prepare(`SELECT * FROM courier_tracking WHERE order_id = ?`)
+      .get(orderId) as Record<string, unknown> | undefined;
+    if (existing) return existing;
+
+    const order =
+      orderRow ??
+      (this.db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId) as
+        | Record<string, unknown>
+        | undefined);
+
+    if (!order) {
+      throw new DomainError(`Commande #${orderId} introuvable`, 404, 'ORDER_NOT_FOUND');
+    }
+
+    const plan = buildCityRoutePlan({
+      shippingCity: String(order.shipping_city),
+      shippingCountry: String(order.shipping_country),
+      shippingAddress: String(order.shipping_address),
+      landmark: String(order.landmark || ''),
+      seedOffset: orderId,
+    });
+    const progress = String(order.status) === 'shipped' ? 25 : 0;
+    const telemetry = interpolateAlongRoute(plan.waypoints, progress);
+    const status: CourierTrackingStatus =
+      String(order.status) === 'shipped' ? 'en_route' : 'awaiting_dispatch';
+
+    this.db
+      .prepare(
+        `INSERT INTO courier_tracking (
+           order_id, courier_name, courier_phone, vehicle_label, vehicle_plate, hub_name,
+           origin_lat, origin_lng, destination_lat, destination_lng,
+           current_lat, current_lng, heading_deg, speed_kmh, progress_pct,
+           eta_minutes, distance_remaining_km, total_distance_km, status, last_checkpoint, waypoints_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        orderId,
+        plan.courierName,
+        plan.courierPhone,
+        plan.vehicleLabel,
+        plan.vehiclePlate,
+        plan.hubName,
+        plan.originLat,
+        plan.originLng,
+        plan.destinationLat,
+        plan.destinationLng,
+        telemetry.lat,
+        telemetry.lng,
+        telemetry.headingDeg,
+        telemetry.speedKmh,
+        progress,
+        telemetry.etaMinutes,
+        telemetry.distanceRemainingKm,
+        telemetry.totalDistanceKm,
+        status,
+        telemetry.lastCheckpoint,
+        JSON.stringify(plan.waypoints)
+      );
+
+    return this.db
+      .prepare(`SELECT * FROM courier_tracking WHERE order_id = ?`)
+      .get(orderId) as Record<string, unknown>;
+  }
+
+  public getOrderTracking(orderId: number): CourierTrackingDTO {
+    const row = this.ensureTrackingRow(orderId);
+    return this.mapTrackingRow(row);
+  }
+
+  public pulseOrderTracking(
+    orderId: number,
+    stepDelta = 12
+  ): { order: OrderDTO; tracking: CourierTrackingDTO } {
+    const tx = this.db.transaction(() => {
+      const orderRow = this.db
+        .prepare(`SELECT * FROM orders WHERE id = ?`)
+        .get(orderId) as Record<string, unknown> | undefined;
+
+      if (!orderRow) {
+        throw new DomainError(`Commande #${orderId} introuvable`, 404, 'ORDER_NOT_FOUND');
+      }
+
+      const orderStatus = String(orderRow.status) as OrderStatus;
+      if (orderStatus === 'cancelled' || orderStatus === 'payment_failed') {
+        throw new DomainError(
+          'Suivi GPS indisponible pour une commande annulée ou non réglée.',
+          400,
+          'TRACKING_UNAVAILABLE'
+        );
+      }
+
+      if (orderStatus === 'pending_payment') {
+        throw new DomainError(
+          'Veuillez confirmer votre règlement avant le départ du coursier.',
+          400,
+          'PAYMENT_REQUIRED_FOR_DISPATCH'
+        );
+      }
+
+      const trackingRow = this.ensureTrackingRow(orderId, orderRow);
+      const currentProgress = Number(trackingRow.progress_pct || 0);
+      const previousTrackingStatus = String(trackingRow.status) as CourierTrackingStatus;
+
+      // Transition paid/preparing order to shipped automatically when live dispatch pulse runs
+      if (orderStatus === 'paid' || orderStatus === 'preparing') {
+        this.db
+          .prepare(`UPDATE orders SET status = 'shipped', updated_at = datetime('now') WHERE id = ?`)
+          .run(orderId);
+      }
+
+      const clampedDelta = Math.max(4, Math.min(35, Math.round(stepDelta)));
+      const nextProgress =
+        previousTrackingStatus === 'delivered'
+          ? 100
+          : Math.min(100, currentProgress === 0 ? 15 : currentProgress + clampedDelta);
+
+      const waypoints = this.parseWaypoints(String(trackingRow.waypoints_json));
+      const telemetry = interpolateAlongRoute(waypoints, nextProgress);
+
+      const nextStatus: CourierTrackingStatus =
+        nextProgress >= 100
+          ? 'delivered'
+          : nextProgress >= 80
+            ? 'arriving_soon'
+            : 'en_route';
+
+      this.db
+        .prepare(
+          `UPDATE courier_tracking
+           SET progress_pct = ?, current_lat = ?, current_lng = ?, heading_deg = ?,
+               speed_kmh = ?, eta_minutes = ?, distance_remaining_km = ?,
+               status = ?, last_checkpoint = ?, updated_at = datetime('now')
+           WHERE order_id = ?`
+        )
+        .run(
+          nextProgress,
+          telemetry.lat,
+          telemetry.lng,
+          telemetry.headingDeg,
+          telemetry.speedKmh,
+          telemetry.etaMinutes,
+          telemetry.distanceRemainingKm,
+          nextStatus,
+          telemetry.lastCheckpoint,
+          orderId
+        );
+
+      if (previousTrackingStatus !== 'arriving_soon' && nextStatus === 'arriving_soon') {
+        this.sendSimulatedEmail({
+          orderId,
+          recipientEmail: String(orderRow.customer_email),
+          subject: `[SMS / WhatsApp] Votre coursier Maison Véra arrive dans ${telemetry.etaMinutes} min (${String(orderRow.order_number)})`,
+          templateName: 'courier_arriving_soon',
+          bodyText: `Bonjour ${String(orderRow.customer_name)},\n\nVotre coursier ${String(trackingRow.courier_name)} (${String(trackingRow.vehicle_plate)}) approche de votre adresse : ${telemetry.lastCheckpoint}. Arrivée estimée dans ${telemetry.etaMinutes} minutes.`,
+        });
+      } else if (previousTrackingStatus !== 'delivered' && nextStatus === 'delivered') {
+        this.sendSimulatedEmail({
+          orderId,
+          recipientEmail: String(orderRow.customer_email),
+          subject: `Maison Véra — Commande ${String(orderRow.order_number)} livrée avec succès`,
+          templateName: 'courier_delivered',
+          bodyText: `Bonjour ${String(orderRow.customer_name)},\n\nVotre commande ${String(orderRow.order_number)} a été remise en main propre par ${String(trackingRow.courier_name)}. Votre certificat d'authenticité reste accessible à tout moment dans votre espace client.`,
+        });
+      }
+    });
+
+    tx();
+    const order = this.getOrderById(orderId);
+    return { order, tracking: order.tracking! };
+  }
+
+  public updateOrderTrackingAsAdmin(
+    orderId: number,
+    rawInput: z.infer<typeof AdminCourierTrackingUpdateSchema>,
+    adminUser: UserProfile,
+    ipAddress = '127.0.0.1'
+  ): { order: OrderDTO; tracking: CourierTrackingDTO } {
+    const input = AdminCourierTrackingUpdateSchema.parse(rawInput);
+
+    const tx = this.db.transaction(() => {
+      const orderRow = this.db
+        .prepare(`SELECT * FROM orders WHERE id = ?`)
+        .get(orderId) as Record<string, unknown> | undefined;
+      if (!orderRow) {
+        throw new DomainError(`Commande #${orderId} introuvable`, 404, 'ORDER_NOT_FOUND');
+      }
+
+      const trackingRow = this.ensureTrackingRow(orderId, orderRow);
+      const waypoints = this.parseWaypoints(String(trackingRow.waypoints_json));
+
+      let nextProgress =
+        input.progressPct !== undefined ? input.progressPct : Number(trackingRow.progress_pct);
+      if (input.status === 'delivered') nextProgress = 100;
+      else if (input.status === 'arriving_soon' && nextProgress < 80) nextProgress = 85;
+      else if (input.status === 'en_route' && nextProgress < 15) nextProgress = 20;
+      else if (input.status === 'awaiting_dispatch') nextProgress = 0;
+
+      const telemetry = interpolateAlongRoute(waypoints, nextProgress);
+      const nextStatus: CourierTrackingStatus =
+        input.status ??
+        (nextProgress >= 100
+          ? 'delivered'
+          : nextProgress >= 80
+            ? 'arriving_soon'
+            : nextProgress > 0
+              ? 'en_route'
+              : 'awaiting_dispatch');
+
+      const nextCourierName = input.courierName ?? String(trackingRow.courier_name);
+      const nextCourierPhone = input.courierPhone ?? String(trackingRow.courier_phone);
+      const nextCheckpoint = input.lastCheckpoint ?? telemetry.lastCheckpoint;
+
+      if (
+        (nextStatus === 'en_route' || nextStatus === 'arriving_soon' || nextStatus === 'delivered') &&
+        String(orderRow.status) !== 'shipped'
+      ) {
+        this.db
+          .prepare(`UPDATE orders SET status = 'shipped', updated_at = datetime('now') WHERE id = ?`)
+          .run(orderId);
+      }
+
+      this.db
+        .prepare(
+          `UPDATE courier_tracking
+           SET courier_name = ?, courier_phone = ?, progress_pct = ?,
+               current_lat = ?, current_lng = ?, heading_deg = ?,
+               speed_kmh = ?, eta_minutes = ?, distance_remaining_km = ?,
+               status = ?, last_checkpoint = ?, updated_at = datetime('now')
+           WHERE order_id = ?`
+        )
+        .run(
+          nextCourierName,
+          nextCourierPhone,
+          nextProgress,
+          telemetry.lat,
+          telemetry.lng,
+          telemetry.headingDeg,
+          telemetry.speedKmh,
+          telemetry.etaMinutes,
+          telemetry.distanceRemainingKm,
+          nextStatus,
+          nextCheckpoint,
+          orderId
+        );
+
+      this.logAudit({
+        actorUserId: adminUser.id,
+        actorEmail: adminUser.email,
+        action: 'ADMIN_COURIER_TRACKING_UPDATED',
+        targetType: 'order',
+        targetId: String(orderRow.order_number),
+        details: { nextStatus, nextProgress, nextCheckpoint },
+        ipAddress,
+      });
+    });
+
+    tx();
+    const order = this.getOrderById(orderId);
+    return { order, tracking: order.tracking! };
+  }
+
+  private mapOrderRow(
+    row: Record<string, unknown>,
+    preloadedItems?: OrderItemDTO[],
+    preloadedTracking?: CourierTrackingDTO
+  ): OrderDTO {
     const orderId = Number(row.id);
+    const tracking = preloadedTracking ?? this.getOrderTracking(orderId);
     return {
       id: orderId,
       orderNumber: String(row.order_number),
@@ -1036,6 +1487,7 @@ export class EcommerceService {
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
       items: preloadedItems ?? this.getOrderItems(orderId),
+      tracking,
     };
   }
 
@@ -1067,9 +1519,22 @@ export class EcommerceService {
       itemsByOrder.set(orderId, list);
     }
 
-    return rows.map((row) =>
-      this.mapOrderRow(row, itemsByOrder.get(Number(row.id)) || [])
-    );
+    const trackingRows = this.db
+      .prepare(`SELECT * FROM courier_tracking WHERE order_id IN (${placeholders})`)
+      .all(...orderIds) as Array<Record<string, unknown>>;
+
+    const trackingByOrder = new Map<number, CourierTrackingDTO>();
+    for (const t of trackingRows) {
+      trackingByOrder.set(Number(t.order_id), this.mapTrackingRow(t));
+    }
+
+    return rows.map((row) => {
+      const orderId = Number(row.id);
+      const tracking =
+        trackingByOrder.get(orderId) ??
+        this.mapTrackingRow(this.ensureTrackingRow(orderId, row));
+      return this.mapOrderRow(row, itemsByOrder.get(orderId) || [], tracking);
+    });
   }
 
   public checkDatabaseHealth(): { ok: boolean; activeProducts: number } {
@@ -1248,9 +1713,26 @@ export class EcommerceService {
     const nextPriceCents =
       input.priceCents !== undefined ? input.priceCents : Number(existing.price_cents);
 
+    const prevStock = Number(existing.stock);
+    const stockDelta = input.stock - prevStock;
+
     this.db
       .prepare(`UPDATE product_variants SET stock = ?, price_cents = ? WHERE id = ?`)
       .run(input.stock, nextPriceCents, variantId);
+
+    if (stockDelta !== 0) {
+      this.db
+        .prepare(
+          `INSERT INTO stock_movements (variant_id, delta, reason, reference_id)
+           VALUES (?, ?, ?, ?)`
+        )
+        .run(
+          variantId,
+          stockDelta,
+          stockDelta > 0 ? 'restock' : 'admin_adjust',
+          `ADMIN-${String(existing.sku)}`
+        );
+    }
 
     this.logAudit({
       actorUserId: adminUser.id,
@@ -1436,5 +1918,423 @@ export class EcommerceService {
       ipAddress: String(a.ip_address),
       createdAt: String(a.created_at),
     }));
+  }
+
+  // --- Persisted Showroom Appointments ---
+  private mapAppointmentRow(row: Record<string, unknown>): ConciergeAppointmentDTO {
+    return {
+      id: Number(row.id),
+      referenceCode: String(row.reference_code),
+      showroomCity: String(row.showroom_city),
+      customerName: String(row.customer_name),
+      customerPhone: String(row.customer_phone),
+      customerEmail: String(row.customer_email),
+      preferredDate: String(row.preferred_date),
+      projectNote: String(row.project_note || ''),
+      status: String(row.status) as AppointmentStatus,
+      createdAt: String(row.created_at),
+    };
+  }
+
+  public createAppointment(
+    rawInput: z.infer<typeof ConciergeAppointmentSchema>,
+    ipAddress = '127.0.0.1'
+  ): ConciergeAppointmentDTO {
+    const input = ConciergeAppointmentSchema.parse(rawInput);
+    const cityCode = input.showroomCity
+      .replace(/[^A-Za-z]/g, '')
+      .slice(0, 3)
+      .toUpperCase()
+      .padEnd(3, 'X');
+    const referenceCode = `RDV-${new Date().getFullYear()}-${cityCode}${crypto
+      .randomBytes(2)
+      .toString('hex')
+      .toUpperCase()}`;
+
+    const res = this.db
+      .prepare(
+        `INSERT INTO concierge_appointments (
+           reference_code, showroom_city, customer_name, customer_phone, customer_email,
+           preferred_date, project_note, status
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`
+      )
+      .run(
+        referenceCode,
+        input.showroomCity,
+        input.customerName,
+        input.customerPhone,
+        input.customerEmail.toLowerCase(),
+        input.preferredDate,
+        input.projectNote
+      );
+
+    const createdId = Number(res.lastInsertRowid);
+    const row = this.db
+      .prepare(`SELECT * FROM concierge_appointments WHERE id = ?`)
+      .get(createdId) as Record<string, unknown>;
+
+    this.logAudit({
+      actorUserId: null,
+      actorEmail: input.customerEmail.toLowerCase(),
+      action: 'CONCIERGE_APPOINTMENT_CREATED',
+      targetType: 'appointment',
+      targetId: referenceCode,
+      details: {
+        showroomCity: input.showroomCity,
+        preferredDate: input.preferredDate,
+        customerPhone: input.customerPhone,
+      },
+      ipAddress,
+    });
+
+    this.sendSimulatedEmail({
+      orderId: null,
+      recipientEmail: input.customerEmail.toLowerCase(),
+      subject: `Maison Véra — Demande de rendez-vous privé à ${input.showroomCity} (${referenceCode})`,
+      templateName: 'appointment_requested',
+      bodyText: [
+        `Bonjour ${input.customerName},`,
+        ``,
+        `Votre demande d’accueil privé dans notre galerie de ${input.showroomCity} pour le ${input.preferredDate} est bien enregistrée (Réf. ${referenceCode}).`,
+        input.projectNote ? `Objet de votre visite : ${input.projectNote}` : '',
+        `Notre directeur de galerie vous contactera prochainement au ${input.customerPhone} pour finaliser votre réception.`,
+        ``,
+        `Maison Véra — Douala · Abidjan · Dakar · Paris`,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    });
+
+    return this.mapAppointmentRow(row);
+  }
+
+  public listAppointments(): ConciergeAppointmentDTO[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM concierge_appointments ORDER BY id DESC LIMIT 100`)
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapAppointmentRow(r));
+  }
+
+  public updateAppointmentStatusAsAdmin(
+    appointmentId: number,
+    newStatus: AppointmentStatus,
+    adminUser: UserProfile,
+    ipAddress = '127.0.0.1'
+  ): ConciergeAppointmentDTO {
+    const existing = this.db
+      .prepare(`SELECT * FROM concierge_appointments WHERE id = ?`)
+      .get(appointmentId) as Record<string, unknown> | undefined;
+
+    if (!existing) {
+      throw new DomainError(
+        `Rendez-vous #${appointmentId} introuvable`,
+        404,
+        'APPOINTMENT_NOT_FOUND'
+      );
+    }
+
+    this.db
+      .prepare(`UPDATE concierge_appointments SET status = ? WHERE id = ?`)
+      .run(newStatus, appointmentId);
+
+    const updated = this.db
+      .prepare(`SELECT * FROM concierge_appointments WHERE id = ?`)
+      .get(appointmentId) as Record<string, unknown>;
+
+    const dto = this.mapAppointmentRow(updated);
+
+    this.logAudit({
+      actorUserId: adminUser.id,
+      actorEmail: adminUser.email,
+      action: 'ADMIN_APPOINTMENT_STATUS_UPDATED',
+      targetType: 'appointment',
+      targetId: dto.referenceCode,
+      details: { previousStatus: String(existing.status), newStatus },
+      ipAddress,
+    });
+
+    if (newStatus === 'confirmed' || newStatus === 'rescheduled') {
+      this.sendSimulatedEmail({
+        orderId: null,
+        recipientEmail: dto.customerEmail,
+        subject: `Maison Véra — Rendez-vous ${dto.referenceCode} ${newStatus === 'confirmed' ? 'confirmé' : 'à replanifier'} (${dto.showroomCity})`,
+        templateName: 'appointment_status_updated',
+        bodyText:
+          newStatus === 'confirmed'
+            ? `Bonjour ${dto.customerName},\n\nVotre visite privée à la galerie de ${dto.showroomCity} le ${dto.preferredDate} est confirmée par notre direction. Toute l’équipe vous attend avec nos échantillons et pièces numérotées.`
+            : `Bonjour ${dto.customerName},\n\nNotre conciergerie de ${dto.showroomCity} souhaite convenir avec vous d’un nouvel horaire pour votre visite (${dto.referenceCode}). Nous vous appelons au ${dto.customerPhone}.`,
+      });
+    }
+
+    return dto;
+  }
+
+  // --- Inventory Evolution (30d) & Restock Forecasting (14d) ---
+  public getInventoryAnalytics(): InventoryAnalyticsDTO {
+    const WINDOW_DAYS = 30;
+    const FORECAST_DAYS = 14;
+    const SAFETY_BUFFER_PER_VARIANT = 3;
+
+    const variantRows = this.db
+      .prepare(
+        `SELECT v.id as variant_id, v.product_id, v.sku, v.name as variant_name, v.stock,
+                p.title as product_title, p.category
+         FROM product_variants v
+         INNER JOIN products p ON p.id = v.product_id
+         WHERE p.active = 1
+         ORDER BY p.id ASC, v.id ASC`
+      )
+      .all() as Array<{
+        variant_id: number;
+        product_id: number;
+        sku: string;
+        variant_name: string;
+        stock: number;
+        product_title: string;
+        category: Product['category'];
+      }>;
+
+    // Daily aggregated movements in last 30 days
+    const movementRows = this.db
+      .prepare(
+        `SELECT variant_id,
+                date(occurred_at) as day_str,
+                SUM(delta) as net_delta,
+                SUM(CASE WHEN reason = 'sale' THEN ABS(delta) ELSE 0 END) as units_sold,
+                SUM(CASE WHEN reason = 'restock' THEN delta ELSE 0 END) as restock_units
+         FROM stock_movements
+         WHERE occurred_at >= datetime('now', '-30 days')
+         GROUP BY variant_id, date(occurred_at)`
+      )
+      .all() as Array<{
+        variant_id: number;
+        day_str: string;
+        net_delta: number;
+        units_sold: number;
+        restock_units: number;
+      }>;
+
+    // Also inspect direct active sales from orders in the last 30 days so even orders without movement rows count accurately
+    const salesByVariantRows = this.db
+      .prepare(
+        `SELECT oi.variant_id, SUM(oi.quantity) as total_sold
+         FROM order_items oi
+         INNER JOIN orders o ON o.id = oi.order_id
+         WHERE o.status NOT IN ('cancelled', 'payment_failed')
+           AND o.created_at >= datetime('now', '-30 days')
+         GROUP BY oi.variant_id`
+      )
+      .all() as Array<{ variant_id: number; total_sold: number }>;
+
+    const salesByVariantMap = new Map<number, number>(
+      salesByVariantRows.map((r) => [Number(r.variant_id), Number(r.total_sold)])
+    );
+
+    const movementsByVariantDay = new Map<
+      number,
+      Map<string, { netDelta: number; unitsSold: number; restockUnits: number }>
+    >();
+    for (const m of movementRows) {
+      const vId = Number(m.variant_id);
+      let dayMap = movementsByVariantDay.get(vId);
+      if (!dayMap) {
+        dayMap = new Map();
+        movementsByVariantDay.set(vId, dayMap);
+      }
+      dayMap.set(String(m.day_str), {
+        netDelta: Number(m.net_delta),
+        unitsSold: Number(m.units_sold),
+        restockUnits: Number(m.restock_units),
+      });
+    }
+
+    const today = new Date();
+    const formatDateKey = (offsetDays: number) => {
+      const d = new Date(today.getTime() + offsetDays * 24 * 60 * 60 * 1000);
+      return d.toISOString().slice(0, 10);
+    };
+    const formatShortLabel = (isoDate: string) => {
+      const [, mm, dd] = isoDate.split('-');
+      return `${dd}/${mm}`;
+    };
+
+    const historicalDays: string[] = [];
+    for (let i = -WINDOW_DAYS + 1; i <= 0; i++) {
+      historicalDays.push(formatDateKey(i));
+    }
+    const futureDays: string[] = [];
+    for (let i = 1; i <= FORECAST_DAYS; i++) {
+      futureDays.push(formatDateKey(i));
+    }
+
+    const variantAnalytics: VariantRestockPredictionDTO[] = variantRows.map((v) => {
+      const variantId = Number(v.variant_id);
+      const currentStock = Number(v.stock);
+      const dayMap = movementsByVariantDay.get(variantId) || new Map();
+
+      // Reconstruct backward from today's authoritative SQLite stock so J0 === currentStock exactly
+      const stockByDate = new Map<string, number>();
+      let runningStock = currentStock;
+      for (let i = historicalDays.length - 1; i >= 0; i--) {
+        const dayKey = historicalDays[i];
+        stockByDate.set(dayKey, runningStock);
+        const dayMov = dayMap.get(dayKey);
+        if (dayMov) {
+          runningStock = Math.max(0, runningStock - dayMov.netDelta);
+        }
+      }
+
+      const soldLast30d = salesByVariantMap.get(variantId) ?? 0;
+      const dailyVelocity = Number((soldLast30d / WINDOW_DAYS).toFixed(2));
+      const daysUntilStockout =
+        currentStock <= 0
+          ? 0
+          : dailyVelocity > 0
+            ? Math.round(currentStock / dailyVelocity)
+            : null;
+      const projectedStock14d = Math.max(
+        0,
+        Number((currentStock - dailyVelocity * FORECAST_DAYS).toFixed(1))
+      );
+
+      // Target 30-day cover + safety threshold
+      const targetBuffer = Math.max(
+        SAFETY_BUFFER_PER_VARIANT,
+        Math.ceil(dailyVelocity * 30)
+      );
+      const recommendedRestockQty = Math.max(0, targetBuffer - currentStock);
+
+      let urgency: RestockUrgency = 'nominal';
+      if (currentStock === 0 || (daysUntilStockout !== null && daysUntilStockout <= 7)) {
+        urgency = 'critical';
+      } else if (
+        currentStock <= SAFETY_BUFFER_PER_VARIANT ||
+        (daysUntilStockout !== null && daysUntilStockout <= 20)
+      ) {
+        urgency = 'warning';
+      }
+
+      const series: StockHistoryPointDTO[] = historicalDays.map((dayKey, idx) => {
+        const dayMov = dayMap.get(dayKey);
+        const isToday = idx === historicalDays.length - 1;
+        return {
+          date: dayKey,
+          label: isToday ? 'Aujourd’hui' : formatShortLabel(dayKey),
+          isForecast: false,
+          actualStock: stockByDate.get(dayKey) ?? currentStock,
+          projectedStock: isToday ? currentStock : null,
+          safetyThreshold: SAFETY_BUFFER_PER_VARIANT,
+          unitsSold: dayMov?.unitsSold ?? 0,
+          restockUnits: dayMov?.restockUnits ?? 0,
+        };
+      });
+
+      futureDays.forEach((dayKey, idx) => {
+        const offset = idx + 1;
+        const proj = Math.max(
+          0,
+          Number((currentStock - dailyVelocity * offset).toFixed(1))
+        );
+        series.push({
+          date: dayKey,
+          label: `+${offset}j (${formatShortLabel(dayKey)})`,
+          isForecast: true,
+          actualStock: null,
+          projectedStock: proj,
+          safetyThreshold: SAFETY_BUFFER_PER_VARIANT,
+          unitsSold: 0,
+          restockUnits: 0,
+        });
+      });
+
+      return {
+        variantId,
+        productId: Number(v.product_id),
+        productTitle: String(v.product_title),
+        category: v.category,
+        sku: String(v.sku),
+        variantName: String(v.variant_name),
+        currentStock,
+        soldLast30d,
+        dailyVelocity,
+        daysUntilStockout,
+        projectedStock14d,
+        recommendedRestockQty,
+        urgency,
+        series,
+      };
+    });
+
+    // Aggregate Global Series across all variants
+    const globalSeries: StockHistoryPointDTO[] = [];
+    const totalPointsCount = WINDOW_DAYS + FORECAST_DAYS;
+    const globalSafetyThreshold = variantAnalytics.length * SAFETY_BUFFER_PER_VARIANT;
+
+    for (let idx = 0; idx < totalPointsCount; idx++) {
+      const refPoint = variantAnalytics[0]?.series[idx];
+      if (!refPoint) continue;
+
+      let actualSum = 0;
+      let projectedSum = 0;
+      let hasActual = false;
+      let hasProjected = false;
+      let soldSum = 0;
+      let restockSum = 0;
+
+      for (const va of variantAnalytics) {
+        const pt = va.series[idx];
+        if (!pt) continue;
+        if (pt.actualStock !== null) {
+          actualSum += pt.actualStock;
+          hasActual = true;
+        }
+        if (pt.projectedStock !== null) {
+          projectedSum += pt.projectedStock;
+          hasProjected = true;
+        }
+        soldSum += pt.unitsSold;
+        restockSum += pt.restockUnits;
+      }
+
+      globalSeries.push({
+        date: refPoint.date,
+        label: refPoint.label,
+        isForecast: refPoint.isForecast,
+        actualStock: hasActual ? actualSum : null,
+        projectedStock: hasProjected ? Number(projectedSum.toFixed(1)) : null,
+        safetyThreshold: globalSafetyThreshold,
+        unitsSold: soldSum,
+        restockUnits: restockSum,
+      });
+    }
+
+    // Sort variant predictions by urgency then daysUntilStockout
+    const urgencyRank: Record<RestockUrgency, number> = {
+      critical: 0,
+      warning: 1,
+      nominal: 2,
+    };
+    const sortedVariants = [...variantAnalytics].sort((a, b) => {
+      if (urgencyRank[a.urgency] !== urgencyRank[b.urgency]) {
+        return urgencyRank[a.urgency] - urgencyRank[b.urgency];
+      }
+      return (a.daysUntilStockout ?? 9999) - (b.daysUntilStockout ?? 9999);
+    });
+
+    return {
+      generatedAt: new Date().toISOString(),
+      windowDays: WINDOW_DAYS,
+      forecastDays: FORECAST_DAYS,
+      totalUnitsInStock: variantAnalytics.reduce((s, v) => s + v.currentStock, 0),
+      totalSoldLast30d: variantAnalytics.reduce((s, v) => s + v.soldLast30d, 0),
+      criticalVariantsCount: variantAnalytics.filter((v) => v.urgency === 'critical')
+        .length,
+      totalRecommendedRestockUnits: variantAnalytics.reduce(
+        (s, v) => s + v.recommendedRestockQty,
+        0
+      ),
+      globalSeries,
+      variants: sortedVariants,
+    };
   }
 }

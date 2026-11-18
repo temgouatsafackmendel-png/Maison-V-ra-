@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 import { hashPassword } from './security.ts';
+import { buildCityRoutePlan, interpolateAlongRoute } from './geo.ts';
 
 export type DBInstance = Database.Database;
 
@@ -160,6 +161,53 @@ export function runMigrations(db: DBInstance): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS courier_tracking (
+      order_id INTEGER PRIMARY KEY REFERENCES orders(id) ON DELETE CASCADE,
+      courier_name TEXT NOT NULL,
+      courier_phone TEXT NOT NULL,
+      vehicle_label TEXT NOT NULL,
+      vehicle_plate TEXT NOT NULL,
+      hub_name TEXT NOT NULL,
+      origin_lat REAL NOT NULL,
+      origin_lng REAL NOT NULL,
+      destination_lat REAL NOT NULL,
+      destination_lng REAL NOT NULL,
+      current_lat REAL NOT NULL,
+      current_lng REAL NOT NULL,
+      heading_deg REAL NOT NULL DEFAULT 0,
+      speed_kmh INTEGER NOT NULL DEFAULT 0,
+      progress_pct INTEGER NOT NULL DEFAULT 0,
+      eta_minutes INTEGER NOT NULL DEFAULT 30,
+      distance_remaining_km REAL NOT NULL DEFAULT 5.0,
+      total_distance_km REAL NOT NULL DEFAULT 5.0,
+      status TEXT NOT NULL CHECK(status IN ('awaiting_dispatch', 'en_route', 'arriving_soon', 'delivered')) DEFAULT 'awaiting_dispatch',
+      last_checkpoint TEXT NOT NULL,
+      waypoints_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS concierge_appointments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      reference_code TEXT NOT NULL UNIQUE,
+      showroom_city TEXT NOT NULL,
+      customer_name TEXT NOT NULL,
+      customer_phone TEXT NOT NULL,
+      customer_email TEXT NOT NULL,
+      preferred_date TEXT NOT NULL,
+      project_note TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL CHECK(status IN ('pending', 'confirmed', 'completed', 'rescheduled')) DEFAULT 'pending',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS stock_movements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      variant_id INTEGER NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
+      delta INTEGER NOT NULL,
+      reason TEXT NOT NULL CHECK(reason IN ('sale', 'restock', 'cancel_restore', 'admin_adjust')),
+      reference_id TEXT NOT NULL DEFAULT '',
+      occurred_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Secondary Indexes for High-Performance Relational Lookups
     CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
@@ -172,6 +220,10 @@ export function runMigrations(db: DBInstance): void {
     CREATE INDEX IF NOT EXISTS idx_simulated_emails_recipient ON simulated_emails(recipient_email);
     CREATE INDEX IF NOT EXISTS idx_simulated_emails_order_id ON simulated_emails(order_id);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+    CREATE INDEX IF NOT EXISTS idx_courier_tracking_status ON courier_tracking(status);
+    CREATE INDEX IF NOT EXISTS idx_appointments_city ON concierge_appointments(showroom_city);
+    CREATE INDEX IF NOT EXISTS idx_appointments_status ON concierge_appointments(status);
+    CREATE INDEX IF NOT EXISTS idx_stock_movements_variant_date ON stock_movements(variant_id, occurred_at);
   `);
 
   // Safe incremental schema upgrade for existing SQLite files
@@ -390,4 +442,440 @@ export function seedDatabaseIfEmpty(db: DBInstance): void {
     1,
     '2024-01-01T00:00:00Z'
   );
+
+  // Seed one active shipped demonstration order for the member account (without altering initial catalog stock)
+  const existingOrdersCount = db
+    .prepare('SELECT COUNT(*) as count FROM orders')
+    .get() as { count: number };
+
+  if (existingOrdersCount.count === 0) {
+    const claireRow = db
+      .prepare(`SELECT id, email, name FROM users WHERE LOWER(email) = 'claire.moreau@example.test'`)
+      .get() as { id: number; email: string; name: string } | undefined;
+
+    const firstVariant = db
+      .prepare(
+        `SELECT v.id as variant_id, v.product_id, v.sku, v.name as variant_name, v.price_cents, p.title as product_title
+         FROM product_variants v
+         INNER JOIN products p ON p.id = v.product_id
+         WHERE v.sku = 'MV-SOL-BRZ-S'`
+      )
+      .get() as
+      | {
+          variant_id: number;
+          product_id: number;
+          sku: string;
+          variant_name: string;
+          price_cents: number;
+          product_title: string;
+        }
+      | undefined;
+
+    if (claireRow && firstVariant) {
+      const demoOrderRes = db
+        .prepare(
+          `INSERT INTO orders (
+             order_number, user_id, customer_email, customer_name, customer_phone,
+             shipping_address, shipping_city, shipping_postal_code, shipping_country,
+             landmark, delivery_mode, payment_method, payment_phone,
+             subtotal_cents, discount_cents, shipping_cents, tax_cents, total_cents,
+             coupon_code, status, payment_intent_id, idempotency_key, stock_deducted
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'shipped', ?, ?, 1)`
+        )
+        .run(
+          'MV-2026-DLA01',
+          claireRow.id,
+          claireRow.email,
+          claireRow.name,
+          '+237 699 45 12 88',
+          'Quartier Bonapriso, Rue Njo-Njo',
+          'Douala',
+          'BP 4022',
+          'Cameroun',
+          'En face de la Pharmacie du Littoral, 2e portail gris',
+          'home_express',
+          'mtn_momo',
+          '+237 699 45 12 88',
+          firstVariant.price_cents,
+          0,
+          0,
+          Math.round(firstVariant.price_cents - firstVariant.price_cents / 1.2),
+          firstVariant.price_cents,
+          null,
+          'pi_mtn_momo_seed_dla01',
+          'idem_seed_order_dla01'
+        );
+
+      const seededOrderId = Number(demoOrderRes.lastInsertRowid);
+
+      db.prepare(
+        `INSERT INTO order_items (
+           order_id, product_id, variant_id, sku, product_title, variant_name,
+           unit_price_cents, quantity, line_total_cents
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`
+      ).run(
+        seededOrderId,
+        firstVariant.product_id,
+        firstVariant.variant_id,
+        firstVariant.sku,
+        firstVariant.product_title,
+        firstVariant.variant_name,
+        firstVariant.price_cents,
+        firstVariant.price_cents
+      );
+
+      const plan = buildCityRoutePlan({
+        shippingCity: 'Douala',
+        shippingCountry: 'Cameroun',
+        shippingAddress: 'Quartier Bonapriso, Rue Njo-Njo',
+        landmark: 'En face de la Pharmacie du Littoral, 2e portail gris',
+        seedOffset: seededOrderId,
+      });
+      const initialPos = interpolateAlongRoute(plan.waypoints, 42);
+
+      db.prepare(
+        `INSERT INTO courier_tracking (
+           order_id, courier_name, courier_phone, vehicle_label, vehicle_plate, hub_name,
+           origin_lat, origin_lng, destination_lat, destination_lng,
+           current_lat, current_lng, heading_deg, speed_kmh, progress_pct,
+           eta_minutes, distance_remaining_km, total_distance_km, status, last_checkpoint, waypoints_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'en_route', ?, ?)`
+      ).run(
+        seededOrderId,
+        plan.courierName,
+        plan.courierPhone,
+        plan.vehicleLabel,
+        plan.vehiclePlate,
+        plan.hubName,
+        plan.originLat,
+        plan.originLng,
+        plan.destinationLat,
+        plan.destinationLng,
+        initialPos.lat,
+        initialPos.lng,
+        initialPos.headingDeg,
+        initialPos.speedKmh,
+        42,
+        initialPos.etaMinutes,
+        initialPos.distanceRemainingKm,
+        initialPos.totalDistanceKm,
+        initialPos.lastCheckpoint,
+        JSON.stringify(plan.waypoints)
+      );
+
+      db.prepare(
+        `INSERT INTO simulated_emails (order_id, recipient_email, subject, template_name, body_text)
+         VALUES (?, ?, ?, 'order_shipped', ?)`
+      ).run(
+        seededOrderId,
+        claireRow.email,
+        'Maison Véra — Coursier en route pour votre commande MV-2026-DLA01',
+        `Bonjour ${claireRow.name},\n\nNotre coursier ${plan.courierName} (${plan.vehicleLabel}) a quitté la ${plan.hubName} avec votre Lampe Monolithe Solis.\nSuivez son trajet GPS en direct depuis votre espace membre.`
+      );
+    }
+  }
+
+  const existingAppointmentsCount = db
+    .prepare('SELECT COUNT(*) as count FROM concierge_appointments')
+    .get() as { count: number };
+
+  if (existingAppointmentsCount.count === 0) {
+    db.prepare(
+      `INSERT INTO concierge_appointments (
+         reference_code, showroom_city, customer_name, customer_phone, customer_email,
+         preferred_date, project_note, status
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed')`
+    ).run(
+      'RDV-2026-DLA01',
+      'Douala',
+      'Claire Ndongo-Moreau',
+      '+237 699 45 12 88',
+      'claire.moreau@example.test',
+      '2026-11-22',
+      'Écoute privée du Monolithe Acoustique Aeon I et présentation des finitions bronze de Foumban.'
+    );
+  }
+
+  const existingMovementsCount = db
+    .prepare('SELECT COUNT(*) as count FROM stock_movements')
+    .get() as { count: number };
+
+  if (existingMovementsCount.count === 0) {
+    const seedMovementsTx = db.transaction(() => {
+      const variants = db
+        .prepare(
+          `SELECT v.id, v.sku, v.product_id, v.name, v.price_cents, p.title
+           FROM product_variants v
+           INNER JOIN products p ON p.id = v.product_id
+           ORDER BY v.id ASC`
+        )
+        .all() as Array<{
+          id: number;
+          sku: string;
+          product_id: number;
+          name: string;
+          price_cents: number;
+          title: string;
+        }>;
+
+      const skuMap = new Map(variants.map((v) => [v.sku, v]));
+
+      // Realistic 30-day showroom sales & workshop restocks (separate clients so Claire's account & current stock remain untouched)
+      const historicalEvents: Array<{
+        daysAgo: number;
+        sku: string;
+        qty: number;
+        city: string;
+        country: string;
+        buyer: string;
+        email: string;
+        phone: string;
+        method: string;
+        ref: string;
+        restockBeforeDaysAgo?: number;
+        restockQty?: number;
+      }> = [
+        {
+          daysAgo: 27,
+          sku: 'MV-SOL-BRZ-S',
+          qty: 2,
+          city: 'Abidjan',
+          country: 'Côte d’Ivoire',
+          buyer: 'Aminata Koné',
+          email: 'aminata.kone@example.test',
+          phone: '+225 07 08 44 91 20',
+          method: 'orange_money',
+          ref: 'MV-HIST-01',
+          restockBeforeDaysAgo: 28,
+          restockQty: 6,
+        },
+        {
+          daysAgo: 24,
+          sku: 'MV-ARC-OAK-ECR',
+          qty: 2,
+          city: 'Dakar',
+          country: 'Sénégal',
+          buyer: 'Moussa Diallo',
+          email: 'moussa.diallo@example.test',
+          phone: '+221 77 640 18 92',
+          method: 'wave',
+          ref: 'MV-HIST-02',
+          restockBeforeDaysAgo: 26,
+          restockQty: 4,
+        },
+        {
+          daysAgo: 21,
+          sku: 'MV-AEO-BAS-CHP',
+          qty: 3,
+          city: 'Douala',
+          country: 'Cameroun',
+          buyer: 'Jean-Paul Mbarga',
+          email: 'jean.mbarga@example.test',
+          phone: '+237 677 81 30 90',
+          method: 'mtn_momo',
+          ref: 'MV-HIST-03',
+          restockBeforeDaysAgo: 25,
+          restockQty: 8,
+        },
+        {
+          daysAgo: 18,
+          sku: 'MV-SOL-LAI-M',
+          qty: 2,
+          city: 'Paris',
+          country: 'France',
+          buyer: 'Atelier Delacroix',
+          email: 'delacroix.arch@example.test',
+          phone: '+33 6 42 18 90 12',
+          method: 'card',
+          ref: 'MV-HIST-04',
+        },
+        {
+          daysAgo: 15,
+          sku: 'MV-FOR-SET-ROM',
+          qty: 4,
+          city: 'Abidjan',
+          country: 'Côte d’Ivoire',
+          buyer: 'Hôtel Ivoire Design',
+          email: 'achats.ivoire@example.test',
+          phone: '+225 05 44 12 88 00',
+          method: 'orange_money',
+          ref: 'MV-HIST-05',
+          restockBeforeDaysAgo: 19,
+          restockQty: 10,
+        },
+        {
+          daysAgo: 12,
+          sku: 'MV-SOL-BRZ-S',
+          qty: 2,
+          city: 'Yaoundé',
+          country: 'Cameroun',
+          buyer: 'Hélène Atangana',
+          email: 'helene.atangana@example.test',
+          phone: '+237 699 18 22 44',
+          method: 'mtn_momo',
+          ref: 'MV-HIST-06',
+        },
+        {
+          daysAgo: 10,
+          sku: 'MV-ARC-WAL-COG',
+          qty: 2,
+          city: 'Dakar',
+          country: 'Sénégal',
+          buyer: 'Fatou Sarr',
+          email: 'fatou.sarr@example.test',
+          phone: '+221 77 512 44 09',
+          method: 'wave',
+          ref: 'MV-HIST-07',
+          restockBeforeDaysAgo: 14,
+          restockQty: 4,
+        },
+        {
+          daysAgo: 8,
+          sku: 'MV-AEO-DUO-PRO',
+          qty: 2,
+          city: 'Libreville',
+          country: 'Gabon',
+          buyer: 'Marc Ondo',
+          email: 'marc.ondo@example.test',
+          phone: '+241 77 32 10 45',
+          method: 'mtn_momo',
+          ref: 'MV-HIST-08',
+        },
+        {
+          daysAgo: 5,
+          sku: 'MV-SOL-BRZ-S',
+          qty: 3,
+          city: 'Douala',
+          country: 'Cameroun',
+          buyer: 'Studio Kora Architecture',
+          email: 'studio.kora@example.test',
+          phone: '+237 691 74 00 32',
+          method: 'mtn_momo',
+          ref: 'MV-HIST-09',
+        },
+        {
+          daysAgo: 3,
+          sku: 'MV-FOR-VAS-ROM',
+          qty: 3,
+          city: 'Abidjan',
+          country: 'Côte d’Ivoire',
+          buyer: 'Résidence Les Palmiers',
+          email: 'res.palmiers@example.test',
+          phone: '+225 07 09 11 45 66',
+          method: 'orange_money',
+          ref: 'MV-HIST-10',
+        },
+        {
+          daysAgo: 2,
+          sku: 'MV-ARC-OAK-ECR',
+          qty: 2,
+          city: 'Dakar',
+          country: 'Sénégal',
+          buyer: 'Cheikh Ndiaye',
+          email: 'cheikh.ndiaye@example.test',
+          phone: '+221 78 302 15 44',
+          method: 'wave',
+          ref: 'MV-HIST-11',
+        },
+        {
+          daysAgo: 1,
+          sku: 'MV-AEO-CRA-ARG',
+          qty: 2,
+          city: 'Douala',
+          country: 'Cameroun',
+          buyer: 'Nadine Fotso',
+          email: 'nadine.fotso@example.test',
+          phone: '+237 694 31 09 80',
+          method: 'orange_money',
+          ref: 'MV-HIST-12',
+        },
+      ];
+
+      const insertHistOrder = db.prepare(`
+        INSERT OR IGNORE INTO orders (
+          order_number, user_id, customer_email, customer_name, customer_phone,
+          shipping_address, shipping_city, shipping_postal_code, shipping_country,
+          landmark, delivery_mode, payment_method, payment_phone,
+          subtotal_cents, discount_cents, shipping_cents, tax_cents, total_cents,
+          coupon_code, status, payment_intent_id, idempotency_key, stock_deducted, created_at, updated_at
+        ) VALUES (?, NULL, ?, ?, ?, 'Quartier Résidentiel', ?, 'BP 100', ?, 'Galerie Locale', 'home_express', ?, ?, ?, 0, 0, ?, ?, NULL, 'paid', ?, ?, 1, datetime('now', ?), datetime('now', ?))
+      `);
+
+      const insertHistItem = db.prepare(`
+        INSERT INTO order_items (
+          order_id, product_id, variant_id, sku, product_title, variant_name,
+          unit_price_cents, quantity, line_total_cents
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      const insertMovement = db.prepare(`
+        INSERT INTO stock_movements (variant_id, delta, reason, reference_id, occurred_at)
+        VALUES (?, ?, ?, ?, datetime('now', ?))
+      `);
+
+      for (const ev of historicalEvents) {
+        const variant = skuMap.get(ev.sku);
+        if (!variant) continue;
+
+        if (ev.restockBeforeDaysAgo && ev.restockQty) {
+          insertMovement.run(
+            variant.id,
+            ev.restockQty,
+            'restock',
+            `ATELIER-${ev.ref}`,
+            `-${ev.restockBeforeDaysAgo} days`
+          );
+        }
+
+        const lineTotal = variant.price_cents * ev.qty;
+        const tax = Math.round(lineTotal - lineTotal / 1.2);
+        const dayOffset = `-${ev.daysAgo} days`;
+
+        const orderRes = insertHistOrder.run(
+          ev.ref,
+          ev.email,
+          ev.buyer,
+          ev.phone,
+          ev.city,
+          ev.country,
+          ev.method,
+          ev.phone,
+          lineTotal,
+          tax,
+          lineTotal,
+          `pi_hist_${ev.ref.toLowerCase()}`,
+          `idem_hist_${ev.ref.toLowerCase()}`,
+          dayOffset,
+          dayOffset
+        );
+
+        const insertedId = Number(orderRes.lastInsertRowid);
+        if (insertedId > 0) {
+          insertHistItem.run(
+            insertedId,
+            variant.product_id,
+            variant.id,
+            variant.sku,
+            variant.title,
+            variant.name,
+            variant.price_cents,
+            ev.qty,
+            lineTotal
+          );
+          insertMovement.run(variant.id, -ev.qty, 'sale', ev.ref, dayOffset);
+        }
+      }
+
+      // Include Claire's shipped order MV-2026-DLA01 in today's stock movement ledger if present
+      const dla01 = db
+        .prepare(`SELECT id FROM orders WHERE order_number = 'MV-2026-DLA01'`)
+        .get() as { id: number } | undefined;
+      const solBrz = skuMap.get('MV-SOL-BRZ-S');
+      if (dla01 && solBrz) {
+        insertMovement.run(solBrz.id, -1, 'sale', 'MV-2026-DLA01', '-4 days');
+      }
+    });
+
+    seedMovementsTx();
+  }
 }

@@ -5,6 +5,33 @@ Toutes les modifications notables de ce projet sont documentées dans ce fichier
 Le format est basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/),
 et ce projet adhère au [Semantic Versioning (SemVer)](https://semver.org/lang/fr/).
 
+## [1.4.0] - 2026-11-18
+
+### Ajouté (Added)
+- **Réservation Privée en Galerie Persistante (`POST /api/concierge/appointments`)** :
+  - Formulaire de prise de rendez-vous privé intégré directement dans la vue **La Maison & Galeries** (*Douala, Abidjan, Dakar, Paris*) avec génération d'une référence officielle (`RDV-2026-...`), notification e-mail client et journalisation d'audit.
+  - Onglet dédié **« Rendez-Vous Galeries »** dans le Portail de Direction (`AdminDashboard.tsx`) permettant de suivre et mettre à jour le statut des visites (*En attente*, *Confirmé*, *Honoré*, *À replanifier*).
+- **Comparateur Architectural Côte à Côte (`App.tsx`)** :
+  - Sélection jusqu'à 3 créations depuis la boutique (*Comparer*) avec barre flottante dédiée et modale comparative (dimensions, matériaux & tropicalisation, finitions, stocks et tarifs `XAF`/`XOF`/`EUR` avec ajout au panier en 1 clic).
+- **Sélecteur de Créneau de Passage Coursier (`CartDrawer.tsx`)** :
+  - Choix du créneau souhaité (*Matin 09h–12h*, *Après-midi 14h–18h*, *Soirée Privée 18h–20h*) transmis directement aux instructions de livraison du coursier.
+- **Analytique Stocks 30j & Prédictions de Réapprovisionnement (`StockForecastChart.tsx` avec Recharts)** :
+  - Visualisation interactive dans le Portail de Direction (`AdminDashboard.tsx`) : courbe combinée d'évolution des stocks sur 30 jours et projection d'épuisement sur +14 jours, comparatif par édition (`BarChart`), filtres par collection/SKU et pré-remplissage du réassort en 1 clic alimentés par `GET /api/admin/inventory/analytics` et la table `stock_movements`.
+- **Sonde `/api/health` mise à jour** vers la version `1.4.0`.
+
+---
+
+## [1.3.0] - 2026-11-18
+
+### Ajouté (Added)
+- **Suivi GPS en Temps Réel du Coursier (`CourierLiveMap.tsx`, `src/server/geo.ts`)** :
+  - **Carte Interactive dans l'Espace Membre (`AccountPortal.tsx`) & Modale de Suivi (`OrderSandboxModal.tsx`)** : visualisation en direct de l'itinéraire depuis la Galerie de départ jusqu'à l'adresse et au point de repère du client.
+  - **Intégration Google Maps Platform (`@vis.gl/react-google-maps`)** avec `AdvancedMarker`, tracé d'itinéraire dynamique et mode caméra centrée lorsque `VITE_GOOGLE_MAPS_API_KEY` est configurée, complétée par un radar cartographique architectural Pan-Africain intégré.
+  - **Télémétrie Serveur Persistante (`courier_tracking` SQLite)** : endpoints dédiés `GET /api/orders/:id/tracking`, `POST /api/orders/:id/tracking/pulse` et `PATCH /api/admin/orders/:id/tracking` calculant coordonnées GPS (`lat/lng`), cap (`°`), vitesse (`km/h`), distance restante (`km`) et ETA en minutes sur 10 métropoles d'Afrique et d'Europe.
+  - **Actions Directes Coursier** : boutons *Appeler*, *WhatsApp*, *Ouvrir dans Google Maps* et suivi automatique toutes les 3 secondes.
+
+---
+
 ## [1.2.0] - 2026-11-17
 
 ### Ajouté (Added)

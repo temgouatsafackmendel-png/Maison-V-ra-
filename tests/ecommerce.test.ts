@@ -31,6 +31,7 @@ describe('Maison Véra Afrique E-Commerce — Tests Unitaires, Intégration & Pa
       expect(res.headers['x-frame-options']).toBe('SAMEORIGIN');
       expect(res.headers['referrer-policy']).toBe('strict-origin-when-cross-origin');
       expect(res.body.status).toBe('ok');
+      expect(res.body.version).toBe('1.4.0');
       expect(res.body.database).toBe('connected');
       expect(res.body.activeProducts).toBeGreaterThanOrEqual(4);
     });
@@ -390,6 +391,200 @@ describe('Maison Véra Afrique E-Commerce — Tests Unitaires, Intégration & Pa
           (l: { action: string }) => l.action === 'FORBIDDEN_ADMIN_ACCESS_ATTEMPT'
         )
       ).toBe(true);
+    });
+  });
+
+  describe('6. Suivi GPS en Temps Réel du Coursier & Télémétrie Livraison', () => {
+    it('fournit le trajet GPS de la commande membre, protège l’accès et met à jour la position en temps réel', async () => {
+      const customerLogin = await request(app).post('/api/auth/login').send({
+        email: 'claire.moreau@example.test',
+        password: 'ClientVera2026!',
+      });
+      expect(customerLogin.status).toBe(200);
+      const customerToken = customerLogin.body.token;
+
+      // Récupérer les commandes du compte membre (inclut MV-2026-DLA01 en cours de livraison)
+      const myOrdersRes = await request(app)
+        .get('/api/orders/my')
+        .set('Authorization', `Bearer ${customerToken}`);
+      expect(myOrdersRes.status).toBe(200);
+      expect(myOrdersRes.body.orders.length).toBeGreaterThanOrEqual(1);
+
+      const shippedOrder = myOrdersRes.body.orders[0];
+      expect(shippedOrder.tracking).toBeDefined();
+      expect(shippedOrder.tracking.waypoints.length).toBeGreaterThanOrEqual(4);
+
+      // Accès anonyme sans token ni paymentIntentId -> Rejet 403
+      const unauthTracking = await request(app).get(`/api/orders/${shippedOrder.id}/tracking`);
+      expect(unauthTracking.status).toBe(403);
+
+      // Accès membre propriétaire -> 200 OK avec coordonnées GPS et ETA
+      const getTracking = await request(app)
+        .get(`/api/orders/${shippedOrder.id}/tracking`)
+        .set('Authorization', `Bearer ${customerToken}`);
+      expect(getTracking.status).toBe(200);
+      const initialProgress = getTracking.body.tracking.progressPct;
+      const initialLat = getTracking.body.tracking.currentLat;
+
+      // Pulsation télémétrique -> Le coursier avance sur l’itinéraire GPS et recalcule ETA/Lat/Lng
+      const pulseRes = await request(app)
+        .post(`/api/orders/${shippedOrder.id}/tracking/pulse`)
+        .set('Authorization', `Bearer ${customerToken}`)
+        .send({ stepDelta: 20 });
+      expect(pulseRes.status).toBe(200);
+      expect(pulseRes.body.tracking.progressPct).toBeGreaterThan(initialProgress);
+      expect(pulseRes.body.tracking.currentLat).not.toBe(initialLat);
+      expect(pulseRes.body.tracking.etaMinutes).toBeLessThanOrEqual(
+        getTracking.body.tracking.etaMinutes
+      );
+
+      // L’administrateur peut aussi piloter la position du coursier (ex: passer à 100% livré)
+      const adminLogin = await request(app).post('/api/auth/login').send({
+        email: 'admin@maison-vera.test',
+        password: 'AdminVera2026!',
+      });
+      const adminToken = adminLogin.body.token;
+
+      const adminPatch = await request(app)
+        .patch(`/api/admin/orders/${shippedOrder.id}/tracking`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'delivered' });
+      expect(adminPatch.status).toBe(200);
+      expect(adminPatch.body.tracking.status).toBe('delivered');
+      expect(adminPatch.body.tracking.progressPct).toBe(100);
+      expect(adminPatch.body.tracking.distanceRemainingKm).toBe(0);
+    });
+  });
+
+  describe('7. Conciergerie Galeries & Rendez-Vous Privés Persistants (v1.4.0)', () => {
+    it('enregistre un rendez-vous privé en galerie, valide les entrées, protège l’accès admin et met à jour le statut', async () => {
+      // Rejet 400 sur données invalides
+      const badAptRes = await request(app)
+        .post('/api/concierge/appointments')
+        .send({
+          showroomCity: 'Abidjan',
+          customerName: 'A',
+          customerPhone: '12',
+          customerEmail: 'not-an-email',
+          preferredDate: '',
+        });
+      expect(badAptRes.status).toBe(400);
+      expect(badAptRes.body.code).toBe('VALIDATION_ERROR');
+
+      // Création d'une demande valide à Abidjan
+      const createRes = await request(app)
+        .post('/api/concierge/appointments')
+        .send({
+          showroomCity: 'Abidjan',
+          customerName: 'Kouadio Serge',
+          customerPhone: '+225 07 08 44 91 20',
+          customerEmail: 'serge.kouadio@example.test',
+          preferredDate: '2026-12-05',
+          projectNote: 'Écoute privée du Monolithe Acoustique Aeon I',
+        });
+
+      expect(createRes.status).toBe(201);
+      expect(createRes.body.appointment.referenceCode).toMatch(/^RDV-2026-ABI/);
+      expect(createRes.body.appointment.status).toBe('pending');
+      const appointmentId = createRes.body.appointment.id;
+
+      // Protection RBAC : un client standard ne peut pas lister /api/admin/appointments
+      const customerLogin = await request(app).post('/api/auth/login').send({
+        email: 'claire.moreau@example.test',
+        password: 'ClientVera2026!',
+      });
+      const forbiddenApt = await request(app)
+        .get('/api/admin/appointments')
+        .set('Authorization', `Bearer ${customerLogin.body.token}`);
+      expect(forbiddenApt.status).toBe(403);
+
+      // L'administrateur voit le rendez-vous dans /api/admin/overview et peut le confirmer
+      const adminLogin = await request(app).post('/api/auth/login').send({
+        email: 'admin@maison-vera.test',
+        password: 'AdminVera2026!',
+      });
+      const adminToken = adminLogin.body.token;
+
+      const overviewRes = await request(app)
+        .get('/api/admin/overview')
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(overviewRes.status).toBe(200);
+      expect(
+        overviewRes.body.appointments.some(
+          (a: { id: number; showroomCity: string }) =>
+            a.id === appointmentId && a.showroomCity === 'Abidjan'
+        )
+      ).toBe(true);
+
+      const confirmRes = await request(app)
+        .patch(`/api/admin/appointments/${appointmentId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'confirmed' });
+      expect(confirmRes.status).toBe(200);
+      expect(confirmRes.body.appointment.status).toBe('confirmed');
+    });
+  });
+
+  describe('8. Analytique Stocks 30 Jours & Prédictions de Réapprovisionnement', () => {
+    it('calcule la vélocité 30j, l’historique quotidien et la projection +14j, protégés par RBAC admin', async () => {
+      // Un client standard reçoit 403
+      const customerLogin = await request(app).post('/api/auth/login').send({
+        email: 'claire.moreau@example.test',
+        password: 'ClientVera2026!',
+      });
+      const forbiddenAnalytics = await request(app)
+        .get('/api/admin/inventory/analytics')
+        .set('Authorization', `Bearer ${customerLogin.body.token}`);
+      expect(forbiddenAnalytics.status).toBe(403);
+
+      const adminLogin = await request(app).post('/api/auth/login').send({
+        email: 'admin@maison-vera.test',
+        password: 'AdminVera2026!',
+      });
+      const adminToken = adminLogin.body.token;
+
+      const beforeRes = await request(app)
+        .get('/api/admin/inventory/analytics')
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(beforeRes.status).toBe(200);
+      const { analytics } = beforeRes.body;
+
+      expect(analytics.windowDays).toBe(30);
+      expect(analytics.forecastDays).toBe(14);
+      expect(analytics.globalSeries.length).toBe(44); // 30 jours d'historique + 14 jours de prévision
+      expect(analytics.totalSoldLast30d).toBeGreaterThan(0);
+
+      const solBrzBefore = analytics.variants.find(
+        (v: { sku: string }) => v.sku === 'MV-SOL-BRZ-S'
+      );
+      expect(solBrzBefore).toBeDefined();
+      expect(solBrzBefore.currentStock).toBe(8);
+      const soldBefore = solBrzBefore.soldLast30d;
+
+      // Passer une commande de 3 unités sur MV-SOL-BRZ-S (variantId: 1) -> stock passe à 5 et ventes 30j augmentent de 3
+      const orderRes = await request(app)
+        .post('/api/checkout')
+        .send({
+          items: [{ variantId: 1, quantity: 3 }],
+          customerName: 'Amadou Bâ',
+          customerEmail: 'amadou.ba@example.test',
+          shippingAddress: 'Les Almadies',
+          shippingCity: 'Dakar',
+          shippingCountry: 'Sénégal',
+          idempotencyKey: 'idem_analytics_test_001',
+        });
+      expect(orderRes.status).toBe(201);
+
+      const afterRes = await request(app)
+        .get('/api/admin/inventory/analytics')
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(afterRes.status).toBe(200);
+      const solBrzAfter = afterRes.body.analytics.variants.find(
+        (v: { sku: string }) => v.sku === 'MV-SOL-BRZ-S'
+      );
+      expect(solBrzAfter.currentStock).toBe(5);
+      expect(solBrzAfter.soldLast30d).toBe(soldBefore + 3);
+      expect(solBrzAfter.dailyVelocity).toBeGreaterThan(solBrzBefore.dailyVelocity);
     });
   });
 });

@@ -5,10 +5,14 @@ import {
   ShieldCheck,
   Download,
   Search,
+  Navigation,
 } from 'lucide-react';
 import type {
+  AppointmentStatus,
+  ConciergeAppointmentDTO,
   CouponDTO,
   CurrencyCode,
+  InventoryAnalyticsDTO,
   OrderDTO,
   OrderStatus,
   Product,
@@ -24,6 +28,7 @@ import {
   formatOrderStatusLabel,
   formatPaymentMethodLabel,
 } from '../utils/format.ts';
+import { StockForecastChart } from './StockForecastChart.tsx';
 
 interface AdminDashboardProps {
   user: UserProfile | null;
@@ -43,13 +48,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onOpenOrderSandbox,
 }) => {
   const [activeTab, setActiveTab] = useState<
-    'inventory' | 'orders' | 'coupons' | 'communications'
+    'inventory' | 'orders' | 'appointments' | 'coupons' | 'communications'
   >('inventory');
 
   const [products, setProducts] = useState<Product[]>([]);
   const [orders, setOrders] = useState<OrderDTO[]>([]);
+  const [appointments, setAppointments] = useState<ConciergeAppointmentDTO[]>([]);
   const [coupons, setCoupons] = useState<CouponDTO[]>([]);
   const [emails, setEmails] = useState<SimulatedEmailDTO[]>([]);
+  const [inventoryAnalytics, setInventoryAnalytics] =
+    useState<InventoryAnalyticsDTO | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null);
@@ -84,8 +92,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       }
       setProducts(data.products || []);
       setOrders(data.orders || []);
+      setAppointments(data.appointments || []);
       setCoupons(data.coupons || []);
       setEmails(data.emails || []);
+      setInventoryAnalytics(data.inventoryAnalytics || null);
 
       const drafts: Record<number, { stock: string; priceEuros: string }> = {};
       for (const p of data.products || []) {
@@ -207,6 +217,59 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       onCatalogMutated();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Erreur lors de la mise à jour');
+    }
+  };
+
+  const handleAdvanceCourierGps = async (order: OrderDTO) => {
+    setError(null);
+    setFeedbackMessage(null);
+    try {
+      const currentPct = order.tracking?.progressPct ?? 0;
+      const nextProgress = Math.min(100, currentPct === 0 ? 25 : currentPct + 25);
+      const res = await fetch(`/api/admin/orders/${order.id}/tracking`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ progressPct: nextProgress }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Échec de mise à jour GPS');
+
+      setFeedbackMessage(
+        `Coursier ${data.tracking.courierName} (${order.orderNumber}) : ${data.tracking.progressPct}% — ${data.tracking.lastCheckpoint}`
+      );
+      await fetchAdminData();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Erreur GPS');
+    }
+  };
+
+  const handleAppointmentStatusChange = async (
+    appointmentId: number,
+    status: AppointmentStatus
+  ) => {
+    setError(null);
+    setFeedbackMessage(null);
+    try {
+      const res = await fetch(`/api/admin/appointments/${appointmentId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ status }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Échec de mise à jour du rendez-vous');
+
+      setFeedbackMessage(
+        `Rendez-vous ${data.appointment.referenceCode} (${data.appointment.showroomCity}) mis à jour.`
+      );
+      await fetchAdminData();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Erreur');
     }
   };
 
@@ -424,6 +487,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         {[
           { id: 'inventory', label: 'Stocks & Éditions' },
           { id: 'orders', label: `Commandes & Expéditions (${orders.length})` },
+          { id: 'appointments', label: `Rendez-Vous Galeries (${appointments.length})` },
           { id: 'coupons', label: `Codes Privilèges (${coupons.length})` },
           { id: 'communications', label: `Courriers Clients (${emails.length})` },
         ].map((tab) => (
@@ -444,7 +508,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
       {/* Tab 1: Inventory & Variants */}
       {activeTab === 'inventory' && (
-        <div className="bg-white border border-[#E5E0D5] rounded-2xl overflow-hidden">
+        <div className="space-y-6">
+          <StockForecastChart
+            analytics={inventoryAnalytics}
+            loading={loading}
+            onApplyRestockSuggestion={(variantId, recommendedNewStock) => {
+              setVariantDrafts((prev) => {
+                const current = prev[variantId] || { stock: '0', priceEuros: '0.00' };
+                return {
+                  ...prev,
+                  [variantId]: {
+                    ...current,
+                    stock: String(recommendedNewStock),
+                  },
+                };
+              });
+              setFeedbackMessage(
+                `Suggestion de réapprovisionnement pré-remplie (${recommendedNewStock} unités). Cliquez sur « Mettre à jour » dans le tableau ci-dessous pour enregistrer.`
+              );
+            }}
+          />
+
+          <div className="bg-white border border-[#E5E0D5] rounded-2xl overflow-hidden">
           <div className="px-6 py-4 border-b border-[#E5E0D5] flex items-center justify-between">
             <h2 className="text-base font-semibold text-[#141413]">
               Inventaire des Ateliers & Galeries
@@ -536,6 +621,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </table>
           </div>
         </div>
+        </div>
       )}
 
       {/* Tab 2: Orders */}
@@ -589,6 +675,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     <th className="py-3 px-4 font-medium">Règlement</th>
                     <th className="py-3 px-4 font-medium text-right">Total TTC</th>
                     <th className="py-3 px-4 font-medium">Statut d’avancement</th>
+                    <th className="py-3 px-4 font-medium">Coursier & GPS</th>
                     <th className="py-3 px-4 font-medium text-right">Certificat</th>
                   </tr>
                 </thead>
@@ -637,6 +724,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           <option value="payment_failed">Échec transaction</option>
                         </select>
                       </td>
+                      <td className="py-3 px-4">
+                        {o.status !== 'cancelled' && o.status !== 'payment_failed' ? (
+                          <div className="space-y-1">
+                            <div className="text-[11px] font-medium text-[#141413]">
+                              {o.tracking?.courierName || 'Coursier Maison Véra'} ·{' '}
+                              <span className="font-mono">{o.tracking?.progressPct ?? 0}%</span>
+                            </div>
+                            {(o.tracking?.progressPct ?? 0) < 100 && o.status !== 'pending_payment' && (
+                              <button
+                                type="button"
+                                onClick={() => handleAdvanceCourierGps(o)}
+                                className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium bg-[#FAF7F2] border border-[#DED8CC] rounded-md hover:bg-[#F2ECE1] text-[#141413] cursor-pointer"
+                              >
+                                <Navigation className="w-3 h-3 text-[#C86D51]" />
+                                <span>Avancer GPS +25%</span>
+                              </button>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-[11px] text-[#78746C]">—</span>
+                        )}
+                      </td>
                       <td className="py-3 px-4 text-right">
                         <button
                           type="button"
@@ -655,7 +764,87 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
-      {/* Tab 3: Coupons */}
+      {/* Tab 3: Showroom Private Appointments */}
+      {activeTab === 'appointments' && (
+        <div className="bg-white border border-[#E5E0D5] rounded-2xl overflow-hidden">
+          <div className="px-6 py-4 border-b border-[#E5E0D5] flex items-center justify-between">
+            <h2 className="text-base font-semibold text-[#141413]">
+              Demandes d’Accueil Privé en Galeries ({appointments.length})
+            </h2>
+            <span className="text-xs text-[#78746C]">
+              Douala · Abidjan · Dakar · Paris
+            </span>
+          </div>
+
+          {appointments.length === 0 ? (
+            <div className="p-10 text-center text-xs text-[#78746C]">
+              Aucune demande de rendez-vous enregistrée pour le moment.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-[#F2ECE1] text-[#57534E] border-b border-[#E5E0D5]">
+                  <tr>
+                    <th className="py-3 px-4 font-medium">Référence</th>
+                    <th className="py-3 px-4 font-medium">Galerie & Date</th>
+                    <th className="py-3 px-4 font-medium">Visiteur</th>
+                    <th className="py-3 px-4 font-medium">Projet / Pièces</th>
+                    <th className="py-3 px-4 font-medium text-right">Statut</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#E5E0D5]">
+                  {appointments.map((apt) => (
+                    <tr key={apt.id} className="hover:bg-[#FAF7F2]">
+                      <td className="py-3 px-4 font-mono font-semibold text-[#141413]">
+                        {apt.referenceCode}
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="font-medium text-[#141413]">
+                          Galerie {apt.showroomCity}
+                        </div>
+                        <div className="font-mono text-[11px] text-[#78746C]">
+                          Souhaité le {apt.preferredDate}
+                        </div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="font-medium text-[#141413]">
+                          {apt.customerName}
+                        </div>
+                        <div className="text-[#78746C] font-mono text-[11px]">
+                          {apt.customerPhone} · {apt.customerEmail}
+                        </div>
+                      </td>
+                      <td className="py-3 px-4 text-[#3F3F46] max-w-xs">
+                        {apt.projectNote || 'Visite générale de la collection'}
+                      </td>
+                      <td className="py-3 px-4 text-right">
+                        <select
+                          aria-label={`Statut rendez-vous ${apt.referenceCode}`}
+                          value={apt.status}
+                          onChange={(e) =>
+                            handleAppointmentStatusChange(
+                              apt.id,
+                              e.target.value as AppointmentStatus
+                            )
+                          }
+                          className="px-2.5 py-1.5 text-xs bg-white border border-[#DED8CC] rounded-lg text-[#141413]"
+                        >
+                          <option value="pending">En attente</option>
+                          <option value="confirmed">Confirmé</option>
+                          <option value="completed">Honoré</option>
+                          <option value="rescheduled">À replanifier</option>
+                        </select>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Tab 4: Coupons */}
       {activeTab === 'coupons' && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 bg-white border border-[#E5E0D5] rounded-2xl overflow-hidden">

@@ -12,6 +12,7 @@ import {
   Sparkles,
   Gift,
   Check,
+  Clock,
 } from 'lucide-react';
 import type {
   CartItemInput,
@@ -156,6 +157,7 @@ export const CartDrawer: React.FC<CartDrawerProps> = ({
   const [paymentMethod, setPaymentMethod] =
     useState<PaymentMethodType>('mtn_momo');
   const [paymentPhone, setPaymentPhone] = useState('+237 699 45 12 88');
+  const [deliverySlot, setDeliverySlot] = useState('Après-midi (14h00 – 18h00)');
   const [includeGiftNote, setIncludeGiftNote] = useState(false);
   const [giftDedication, setGiftDedication] = useState('');
 
@@ -200,10 +202,12 @@ export const CartDrawer: React.FC<CartDrawerProps> = ({
     setCheckoutError(null);
 
     const idempotencyKey = `chk_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-    const enrichedLandmark =
-      includeGiftNote && giftDedication.trim()
-        ? `${landmark ? `${landmark} · ` : ''}[Certificat dédicacé : ${giftDedication.trim()}]`
-        : landmark;
+    const landmarkParts = [landmark.trim()].filter(Boolean);
+    landmarkParts.push(`[Créneau souhaité : ${deliverySlot}]`);
+    if (includeGiftNote && giftDedication.trim()) {
+      landmarkParts.push(`[Certificat dédicacé : ${giftDedication.trim()}]`);
+    }
+    const enrichedLandmark = landmarkParts.join(' · ');
 
     try {
       const headers: Record<string, string> = {
@@ -675,6 +679,34 @@ export const CartDrawer: React.FC<CartDrawerProps> = ({
                   placeholder="Ex: En face de l'Hôtel Akwa Palace, 2e portail"
                   className="w-full px-3 py-2 text-sm bg-white border border-[#DED8CC] rounded-xl focus:outline-none focus:border-[#141413]"
                 />
+              </div>
+
+              {/* Preferred Delivery Window */}
+              <div className="space-y-1.5">
+                <span className="text-xs font-medium text-[#3F3F46] flex items-center gap-1.5">
+                  <Clock className="w-3.5 h-3.5 text-[#C86D51]" />
+                  <span>Créneau de passage souhaité :</span>
+                </span>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5">
+                  {[
+                    'Matin (09h00 – 12h00)',
+                    'Après-midi (14h00 – 18h00)',
+                    'Soirée Privée (18h00 – 20h00)',
+                  ].map((slot) => (
+                    <button
+                      key={slot}
+                      type="button"
+                      onClick={() => setDeliverySlot(slot)}
+                      className={`px-2.5 py-2 text-[11px] rounded-xl border text-center transition-colors whitespace-nowrap cursor-pointer ${
+                        deliverySlot === slot
+                          ? 'bg-[#141413] text-[#FAF7F2] border-[#141413] font-medium'
+                          : 'bg-white text-[#57534E] border-[#DED8CC] hover:bg-[#F2ECE1]'
+                      }`}
+                    >
+                      {slot}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               {/* Optional Calligraphed Certificate Dedication */}

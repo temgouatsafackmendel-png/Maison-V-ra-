@@ -4,9 +4,12 @@ import { ZodError, z } from 'zod';
 import type { DBInstance } from './db.ts';
 import {
   AdminCouponCreateSchema,
+  AdminCourierTrackingUpdateSchema,
   AdminStockUpdateSchema,
+  AppointmentStatusUpdateSchema,
   CartQuoteRequestSchema,
   CheckoutRequestSchema,
+  ConciergeAppointmentSchema,
   DomainError,
   EcommerceService,
   LoginSchema,
@@ -148,7 +151,7 @@ export function createApiApp(db: DBInstance) {
       res.status(200).json({
         status: 'ok',
         service: 'maison-vera-ecommerce',
-        version: '1.0.0',
+        version: '1.4.0',
         database: health.ok ? 'connected' : 'degraded',
         activeProducts: health.activeProducts,
         timestamp: new Date().toISOString(),
@@ -182,6 +185,21 @@ export function createApiApp(db: DBInstance) {
       next(err);
     }
   });
+
+  // --- Showroom Private Appointment Requests ---
+  app.post(
+    '/api/concierge/appointments',
+    rateLimit(20, 60_000),
+    (req: AuthenticatedRequest, res, next) => {
+      try {
+        const parsed = ConciergeAppointmentSchema.parse(req.body);
+        const appointment = service.createAppointment(parsed, req.ip);
+        res.status(201).json({ appointment });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
 
   // --- Transactional Checkout (Server Price Recalculation + Stock Reservation) ---
   app.post(
@@ -359,6 +377,72 @@ export function createApiApp(db: DBInstance) {
     }
   });
 
+  app.get('/api/orders/:id/tracking', (req: AuthenticatedRequest, res, next) => {
+    try {
+      const orderId = Number(req.params.id);
+      if (!Number.isInteger(orderId) || orderId <= 0) {
+        throw new DomainError('Identifiant de commande invalide', 400);
+      }
+      const order = service.getOrderById(orderId);
+      const paymentIntentQuery = String(req.query.paymentIntentId || '');
+      const isOwner =
+        req.user &&
+        (req.user.role === 'admin' ||
+          req.user.id === order.userId ||
+          req.user.email.toLowerCase() === order.customerEmail.toLowerCase());
+      const hasValidPaymentIntentToken =
+        paymentIntentQuery && paymentIntentQuery === order.paymentIntentId;
+
+      if (!isOwner && !hasValidPaymentIntentToken) {
+        return res.status(403).json({
+          error: 'Accès non autorisé au suivi GPS de cette commande.',
+          code: 'FORBIDDEN',
+          requestId: req.requestId,
+        });
+      }
+
+      const tracking = service.getOrderTracking(orderId);
+      res.json({ order, tracking });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/orders/:id/tracking/pulse', (req: AuthenticatedRequest, res, next) => {
+    try {
+      const orderId = Number(req.params.id);
+      if (!Number.isInteger(orderId) || orderId <= 0) {
+        throw new DomainError('Identifiant de commande invalide', 400);
+      }
+      const order = service.getOrderById(orderId);
+      const paymentIntentQuery = String(
+        req.query.paymentIntentId || (req.body && req.body.paymentIntentId) || ''
+      );
+      const isOwner =
+        req.user &&
+        (req.user.role === 'admin' ||
+          req.user.id === order.userId ||
+          req.user.email.toLowerCase() === order.customerEmail.toLowerCase());
+      const hasValidPaymentIntentToken =
+        paymentIntentQuery && paymentIntentQuery === order.paymentIntentId;
+
+      if (!isOwner && !hasValidPaymentIntentToken) {
+        return res.status(403).json({
+          error: 'Accès non autorisé à la télémétrie de cette commande.',
+          code: 'FORBIDDEN',
+          requestId: req.requestId,
+        });
+      }
+
+      const stepDelta =
+        typeof req.body?.stepDelta === 'number' ? req.body.stepDelta : 14;
+      const result = service.pulseOrderTracking(orderId, stepDelta);
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // --- Admin Endpoints (Protected by RBAC requireAdmin) ---
   app.get('/api/admin/overview', requireAdmin, (_req, res, next) => {
     try {
@@ -368,6 +452,8 @@ export function createApiApp(db: DBInstance) {
       const webhooks = service.listWebhookEvents();
       const emails = service.listSimulatedEmails();
       const auditLogs = service.listAuditLogs();
+      const appointments = service.listAppointments();
+      const inventoryAnalytics = service.getInventoryAnalytics();
 
       res.json({
         products,
@@ -376,11 +462,54 @@ export function createApiApp(db: DBInstance) {
         webhooks,
         emails,
         auditLogs,
+        appointments,
+        inventoryAnalytics,
       });
     } catch (err) {
       next(err);
     }
   });
+
+  app.get('/api/admin/inventory/analytics', requireAdmin, (_req, res, next) => {
+    try {
+      const analytics = service.getInventoryAnalytics();
+      res.json({ analytics });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/admin/appointments', requireAdmin, (_req, res, next) => {
+    try {
+      const appointments = service.listAppointments();
+      res.json({ appointments });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.patch(
+    '/api/admin/appointments/:id',
+    requireAdmin,
+    (req: AuthenticatedRequest, res, next) => {
+      try {
+        const appointmentId = Number(req.params.id);
+        if (!Number.isInteger(appointmentId) || appointmentId <= 0) {
+          throw new DomainError('Identifiant de rendez-vous invalide', 400);
+        }
+        const { status } = AppointmentStatusUpdateSchema.parse(req.body);
+        const appointment = service.updateAppointmentStatusAsAdmin(
+          appointmentId,
+          status,
+          req.user!,
+          req.ip
+        );
+        res.json({ appointment });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
 
   app.patch(
     '/api/admin/variants/:id',
@@ -426,6 +555,29 @@ export function createApiApp(db: DBInstance) {
           req.ip
         );
         res.json({ order });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.patch(
+    '/api/admin/orders/:id/tracking',
+    requireAdmin,
+    (req: AuthenticatedRequest, res, next) => {
+      try {
+        const orderId = Number(req.params.id);
+        if (!Number.isInteger(orderId) || orderId <= 0) {
+          throw new DomainError('Identifiant de commande invalide', 400);
+        }
+        const parsed = AdminCourierTrackingUpdateSchema.parse(req.body);
+        const result = service.updateOrderTrackingAsAdmin(
+          orderId,
+          parsed,
+          req.user!,
+          req.ip
+        );
+        res.json(result);
       } catch (err) {
         next(err);
       }

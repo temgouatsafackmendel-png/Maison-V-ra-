@@ -8,6 +8,7 @@ import {
   Sparkles,
   RotateCcw,
   Award,
+  Navigation,
 } from 'lucide-react';
 import type {
   CartItemInput,
@@ -23,6 +24,7 @@ import {
   formatOrderStatusLabel,
   formatPaymentMethodLabel,
 } from '../utils/format.ts';
+import { CourierLiveMap } from './CourierLiveMap.tsx';
 
 interface AccountPortalProps {
   user: UserProfile | null;
@@ -59,6 +61,7 @@ export const AccountPortal: React.FC<AccountPortalProps> = ({
   const [orders, setOrders] = useState<OrderDTO[]>([]);
   const [emails, setEmails] = useState<SimulatedEmailDTO[]>([]);
   const [loadingOrders, setLoadingOrders] = useState(false);
+  const [selectedTrackingOrderId, setSelectedTrackingOrderId] = useState<number | null>(null);
 
   const fetchMyOrders = async () => {
     if (!authToken) return;
@@ -69,8 +72,20 @@ export const AccountPortal: React.FC<AccountPortalProps> = ({
       });
       if (res.ok) {
         const data = await res.json();
-        setOrders(data.orders || []);
+        const loadedOrders: OrderDTO[] = data.orders || [];
+        setOrders(loadedOrders);
         setEmails(data.emails || []);
+
+        const preferredOrder =
+          loadedOrders.find((o) => o.status === 'shipped') ??
+          loadedOrders.find((o) => o.status === 'preparing' || o.status === 'paid') ??
+          loadedOrders.find((o) => o.status !== 'cancelled' && o.status !== 'payment_failed') ??
+          null;
+        setSelectedTrackingOrderId((prev) =>
+          prev && loadedOrders.some((o) => o.id === prev)
+            ? prev
+            : preferredOrder?.id ?? null
+        );
       }
     } finally {
       setLoadingOrders(false);
@@ -82,6 +97,16 @@ export const AccountPortal: React.FC<AccountPortalProps> = ({
       fetchMyOrders();
     }
   }, [user, authToken]);
+
+  const activeTrackingOrder =
+    orders.find((o) => o.id === selectedTrackingOrderId) ??
+    orders.find((o) => o.status === 'shipped') ??
+    orders.find((o) => o.status !== 'cancelled' && o.status !== 'payment_failed') ??
+    null;
+
+  const handleOrderUpdated = (updated: OrderDTO) => {
+    setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
+  };
 
   const handleTrackOrder = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -410,6 +435,39 @@ export const AccountPortal: React.FC<AccountPortalProps> = ({
             </div>
           </div>
 
+          {/* Real-Time Courier GPS Map Section in Member Account */}
+          {activeTrackingOrder && (
+            <div id="member-live-gps-panel" className="space-y-3">
+              {orders.filter((o) => o.status !== 'cancelled' && o.status !== 'payment_failed').length > 1 && (
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-[#57534E]">
+                    Expédition suivie en direct sur la carte :
+                  </span>
+                  <select
+                    aria-label="Choisir la commande à suivre sur la carte GPS"
+                    value={activeTrackingOrder.id}
+                    onChange={(e) => setSelectedTrackingOrderId(Number(e.target.value))}
+                    className="px-3 py-1.5 text-xs font-mono bg-white border border-[#DED8CC] rounded-xl text-[#141413]"
+                  >
+                    {orders
+                      .filter((o) => o.status !== 'cancelled' && o.status !== 'payment_failed')
+                      .map((o) => (
+                        <option key={o.id} value={o.id}>
+                          {o.orderNumber} — {o.shippingCity} ({formatOrderStatusLabel(o.status)})
+                        </option>
+                      ))}
+                  </select>
+                </div>
+              )}
+
+              <CourierLiveMap
+                order={activeTrackingOrder}
+                authToken={authToken}
+                onOrderUpdated={handleOrderUpdated}
+              />
+            </div>
+          )}
+
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
             {/* Orders History */}
             <div className="lg:col-span-2 space-y-4">
@@ -481,6 +539,29 @@ export const AccountPortal: React.FC<AccountPortalProps> = ({
                           </strong>
                         </div>
                         <div className="flex flex-wrap items-center gap-2">
+                          {o.status !== 'cancelled' && o.status !== 'payment_failed' && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSelectedTrackingOrderId(o.id);
+                                document
+                                  .getElementById('member-live-gps-panel')
+                                  ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                              }}
+                              className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-xl border transition-colors cursor-pointer ${
+                                activeTrackingOrder?.id === o.id
+                                  ? 'bg-[#C86D51] text-white border-[#C86D51]'
+                                  : 'border-[#DED8CC] bg-[#FAF7F2] text-[#141413] hover:bg-[#F2ECE1]'
+                              }`}
+                            >
+                              <Navigation className="w-3.5 h-3.5" />
+                              <span>
+                                {o.tracking?.status === 'en_route' || o.tracking?.status === 'arriving_soon'
+                                  ? `Coursier Live (${o.tracking.etaMinutes} min)`
+                                  : 'Suivi GPS'}
+                              </span>
+                            </button>
+                          )}
                           {onReorderItems && (
                             <button
                               type="button"

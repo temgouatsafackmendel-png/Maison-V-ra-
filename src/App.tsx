@@ -26,10 +26,13 @@ import {
   Compass,
   Award,
   Heart,
+  Calendar,
+  Columns3,
 } from 'lucide-react';
 import type {
   CartItemInput,
   CartQuote,
+  ConciergeAppointmentDTO,
   CurrencyCode,
   DeliveryModeType,
   OrderDTO,
@@ -154,15 +157,28 @@ export default function App() {
   const [pdpCityEstimate, setPdpCityEstimate] = useState<string>('Douala (24h)');
   const [copiedWhatsAppPdp, setCopiedWhatsAppPdp] = useState(false);
 
-  // Showroom interactive state
+  // Showroom interactive state (server-persisted concierge booking)
   const [activeShowroomId, setActiveShowroomId] = useState<string>('douala');
-  const [appointmentBookedCity, setAppointmentBookedCity] = useState<string | null>(null);
+  const [bookedAppointment, setBookedAppointment] =
+    useState<ConciergeAppointmentDTO | null>(null);
+  const [aptName, setAptName] = useState('Claire Ndongo-Moreau');
+  const [aptPhone, setAptPhone] = useState('+237 699 45 12 88');
+  const [aptEmail, setAptEmail] = useState('claire.moreau@example.test');
+  const [aptDate, setAptDate] = useState(() => {
+    const d = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
+    return d.toISOString().slice(0, 10);
+  });
+  const [aptNote, setAptNote] = useState('');
+  const [aptSubmitting, setAptSubmitting] = useState(false);
+  const [aptError, setAptError] = useState<string | null>(null);
 
-  // Filters, Search & Wishlist
+  // Filters, Search, Wishlist & Architectural Comparator
   const [categoryFilter, setCategoryFilter] = useState<string>('Tous');
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState<'featured' | 'price_asc' | 'price_desc'>('featured');
   const [wishlistIds, setWishlistIds] = useState<number[]>([]);
+  const [compareIds, setCompareIds] = useState<number[]>([]);
+  const [isCompareOpen, setIsCompareOpen] = useState(false);
 
   const toggleWishlist = (productId: number, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
@@ -171,6 +187,19 @@ export default function App() {
         ? prev.filter((id) => id !== productId)
         : [...prev, productId]
     );
+  };
+
+  const toggleCompare = (productId: number, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setCompareIds((prev) => {
+      if (prev.includes(productId)) {
+        return prev.filter((id) => id !== productId);
+      }
+      if (prev.length >= 3) {
+        return [...prev.slice(1), productId];
+      }
+      return [...prev, productId];
+    });
   };
 
   // Cart & Quote state
@@ -367,6 +396,41 @@ export default function App() {
     () => SHOWROOMS.find((s) => s.id === activeShowroomId) || SHOWROOMS[0],
     [activeShowroomId]
   );
+
+  const comparedProducts = useMemo(
+    () => products.filter((p) => compareIds.includes(p.id)),
+    [products, compareIds]
+  );
+
+  const handleAppointmentSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAptSubmitting(true);
+    setAptError(null);
+    try {
+      const res = await fetch('/api/concierge/appointments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          showroomCity: activeShowroom.city,
+          customerName: aptName,
+          customerPhone: aptPhone,
+          customerEmail: aptEmail,
+          preferredDate: aptDate,
+          projectNote: aptNote,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Impossible d’enregistrer votre demande');
+      }
+      setBookedAppointment(data.appointment);
+      setAptNote('');
+    } catch (err: unknown) {
+      setAptError(err instanceof Error ? err.message : 'Erreur de communication');
+    } finally {
+      setAptSubmitting(false);
+    }
+  };
 
   return (
     <div className="min-h-screen flex flex-col bg-[#FAF7F2] text-[#141413]">
@@ -735,7 +799,8 @@ export default function App() {
                       aria-selected={activeShowroomId === s.id}
                       onClick={() => {
                         setActiveShowroomId(s.id);
-                        setAppointmentBookedCity(null);
+                        setBookedAppointment(null);
+                        setAptError(null);
                       }}
                       className={`px-4 py-2 text-xs font-medium rounded-lg transition-all cursor-pointer ${
                         activeShowroomId === s.id
@@ -806,8 +871,8 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="lg:col-span-5 bg-[#F2ECE1] border border-[#E5E0D5] rounded-xl p-6 flex flex-col justify-between space-y-6">
-                  <div className="space-y-3">
+                <div className="lg:col-span-5 bg-[#F2ECE1] border border-[#E5E0D5] rounded-xl p-6 flex flex-col justify-between space-y-5">
+                  <div className="space-y-2.5">
                     <span className="inline-flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-[#78746C]">
                       <Building2 className="w-3.5 h-3.5 text-[#141413]" />
                       <span>Rendez-Vous Privé & Prescription</span>
@@ -816,7 +881,7 @@ export default function App() {
                       Réserver un accueil personnalisé à {activeShowroom.city}
                     </h4>
                     <p className="text-xs text-[#57534E] leading-relaxed">
-                      Notre directeur de galerie vous reçoit sur rendez-vous pour vous présenter les finitions (albâtre, bronze, iroko, grès) ou organiser le retrait immédiat de votre commande en ligne.
+                      Notre directeur de galerie vous reçoit sur rendez-vous pour découvrir nos finitions ou préparer le retrait de vos pièces.
                     </p>
                     <div className="p-3 bg-white/80 rounded-lg border border-[#E5E0D5] text-xs text-[#57534E]">
                       <strong className="text-[#141413] block mb-0.5">
@@ -826,39 +891,107 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="space-y-2.5">
-                    {appointmentBookedCity === activeShowroom.city ? (
-                      <div className="p-4 bg-emerald-950 text-emerald-100 rounded-xl text-xs space-y-1">
-                        <div className="font-semibold flex items-center gap-1.5">
-                          <Check className="w-4 h-4 text-emerald-400" />
-                          <span>Demande d’accueil privé enregistrée ({activeShowroom.city})</span>
-                        </div>
-                        <p className="text-emerald-200/90 text-[11px]">
-                          Notre conciergerie ({activeShowroom.phone}) est prête à vous accueillir au {activeShowroom.address}.
-                        </p>
+                  {bookedAppointment && bookedAppointment.showroomCity === activeShowroom.city ? (
+                    <div className="p-4 bg-emerald-950 text-emerald-100 rounded-xl text-xs space-y-2">
+                      <div className="font-semibold flex items-center gap-1.5">
+                        <Check className="w-4 h-4 text-emerald-400" />
+                        <span>
+                          Rendez-vous enregistré · Réf. {bookedAppointment.referenceCode}
+                        </span>
                       </div>
-                    ) : (
+                      <p className="text-emerald-200/90 text-[11px] leading-relaxed">
+                        Merci {bookedAppointment.customerName}. Notre galerie de {activeShowroom.city} ({activeShowroom.phone}) vous accueillera pour le {bookedAppointment.preferredDate} au {activeShowroom.address}.
+                      </p>
                       <button
                         type="button"
-                        onClick={() => setAppointmentBookedCity(activeShowroom.city)}
-                        className="w-full py-3 px-4 bg-[#141413] text-[#FAF7F2] text-xs font-medium rounded-xl hover:bg-[#292826] transition-colors cursor-pointer"
+                        onClick={() => setBookedAppointment(null)}
+                        className="text-[11px] underline underline-offset-4 text-emerald-300 hover:text-white cursor-pointer"
                       >
-                        Demander un rendez-vous privé à {activeShowroom.city}
+                        Planifier une autre visite
                       </button>
-                    )}
+                    </div>
+                  ) : (
+                    <form onSubmit={handleAppointmentSubmit} className="space-y-3">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <input
+                          type="text"
+                          required
+                          value={aptName}
+                          onChange={(e) => setAptName(e.target.value)}
+                          placeholder="Votre nom complet"
+                          aria-label="Nom complet pour le rendez-vous"
+                          className="w-full px-3 py-2 text-xs bg-white border border-[#DED8CC] rounded-xl focus:outline-none focus:border-[#141413]"
+                        />
+                        <input
+                          type="tel"
+                          required
+                          value={aptPhone}
+                          onChange={(e) => setAptPhone(e.target.value)}
+                          placeholder="Téléphone / WhatsApp"
+                          aria-label="Téléphone WhatsApp pour le rendez-vous"
+                          className="w-full px-3 py-2 text-xs font-mono bg-white border border-[#DED8CC] rounded-xl focus:outline-none focus:border-[#141413]"
+                        />
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <input
+                          type="email"
+                          required
+                          value={aptEmail}
+                          onChange={(e) => setAptEmail(e.target.value)}
+                          placeholder="Votre email"
+                          aria-label="Email pour le rendez-vous"
+                          className="w-full px-3 py-2 text-xs bg-white border border-[#DED8CC] rounded-xl focus:outline-none focus:border-[#141413]"
+                        />
+                        <div className="relative">
+                          <Calendar className="w-3.5 h-3.5 text-[#78746C] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                          <input
+                            type="date"
+                            required
+                            value={aptDate}
+                            onChange={(e) => setAptDate(e.target.value)}
+                            aria-label="Date souhaitée"
+                            className="w-full pl-8 pr-3 py-2 text-xs font-mono bg-white border border-[#DED8CC] rounded-xl focus:outline-none focus:border-[#141413]"
+                          />
+                        </div>
+                      </div>
+                      <input
+                        type="text"
+                        value={aptNote}
+                        onChange={(e) => setAptNote(e.target.value)}
+                        placeholder="Pièces à découvrir ou projet (ex: Salon résidentiel, Aeon I...)"
+                        aria-label="Pièces ou projet architectural"
+                        className="w-full px-3 py-2 text-xs bg-white border border-[#DED8CC] rounded-xl focus:outline-none focus:border-[#141413]"
+                      />
 
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setDeliveryMode('pickup_showroom');
-                        setActiveView('storefront');
-                        setIsCartOpen(true);
-                      }}
-                      className="w-full py-2.5 px-4 bg-white border border-[#DED8CC] text-[#141413] text-xs font-medium rounded-xl hover:bg-[#FAF7F2] transition-colors cursor-pointer"
-                    >
-                      Choisir le retrait gratuit dans cette galerie
-                    </button>
-                  </div>
+                      {aptError && (
+                        <p className="text-[11px] text-red-700" role="alert">
+                          {aptError}
+                        </p>
+                      )}
+
+                      <button
+                        type="submit"
+                        disabled={aptSubmitting}
+                        className="w-full py-3 px-4 bg-[#141413] text-[#FAF7F2] text-xs font-medium rounded-xl hover:bg-[#292826] disabled:opacity-50 transition-colors cursor-pointer"
+                      >
+                        {aptSubmitting
+                          ? 'Enregistrement en cours...'
+                          : `Confirmer ma demande à ${activeShowroom.city}`}
+                      </button>
+                    </form>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDeliveryMode('pickup_showroom');
+                      setActiveView('storefront');
+                      setIsCartOpen(true);
+                    }}
+                    className="w-full py-2.5 px-4 bg-white border border-[#DED8CC] text-[#141413] text-xs font-medium rounded-xl hover:bg-[#FAF7F2] transition-colors cursor-pointer"
+                  >
+                    Choisir le retrait gratuit dans cette galerie
+                  </button>
                 </div>
               </div>
             </div>
@@ -1291,7 +1424,7 @@ export default function App() {
                         </div>
 
                         {/* Card Footer Actions */}
-                        <div className="px-6 md:px-7 pb-6 pt-2 flex items-center gap-2.5">
+                        <div className="px-6 md:px-7 pb-6 pt-2 flex items-center gap-2">
                           <button
                             type="button"
                             disabled={isOutOfStock}
@@ -1303,10 +1436,10 @@ export default function App() {
                             {wasJustAdded ? (
                               <>
                                 <Check className="w-4 h-4 text-[#D4A373]" />
-                                <span>Pièce ajoutée à votre sélection</span>
+                                <span>Pièce ajoutée</span>
                               </>
                             ) : isOutOfStock ? (
-                              <span>Édition momentanément épuisée</span>
+                              <span>Édition épuisée</span>
                             ) : (
                               <>
                                 <ShoppingBag className="w-3.5 h-3.5 text-[#D4A373]" />
@@ -1322,11 +1455,28 @@ export default function App() {
 
                           <button
                             type="button"
+                            onClick={(e) => toggleCompare(product.id, e)}
+                            aria-label={`Comparer ${product.title}`}
+                            title="Comparer les dimensions, finitions et prix"
+                            className={`px-3 py-3 border rounded-xl text-xs font-medium transition-colors inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer ${
+                              compareIds.includes(product.id)
+                                ? 'bg-[#C86D51] border-[#C86D51] text-white'
+                                : 'bg-white border-[#DED8CC] text-[#57534E] hover:text-[#141413] hover:bg-[#FAF7F2]'
+                            }`}
+                          >
+                            <Columns3 className="w-3.5 h-3.5" />
+                            <span className="hidden sm:inline">
+                              {compareIds.includes(product.id) ? 'Comparé' : 'Comparer'}
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
                             onClick={() => {
                               setPdpProduct(product);
                               setPdpQty(1);
                             }}
-                            className="px-3.5 py-3 border border-[#DED8CC] bg-[#FAF7F2] text-[#141413] rounded-xl hover:bg-[#F2ECE1] transition-colors inline-flex items-center gap-1.5 text-xs font-medium cursor-pointer"
+                            className="px-3.5 py-3 border border-[#DED8CC] bg-[#FAF7F2] text-[#141413] rounded-xl hover:bg-[#F2ECE1] transition-colors inline-flex items-center gap-1 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
                             aria-label={`Détails de ${product.title}`}
                             title="Inspecter les dimensions, le façonnage et les délais de livraison"
                           >
@@ -1669,6 +1819,178 @@ export default function App() {
           setSandboxOrder(createdOrder);
         }}
       />
+
+      {/* Floating Architectural Comparison Dock */}
+      {compareIds.length > 0 && activeView === 'storefront' && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-35 bg-[#141413] text-[#FAF7F2] px-4 py-2.5 rounded-2xl shadow-2xl border border-[#2E2D2A] flex items-center gap-4 text-xs max-w-[92vw]">
+          <div className="flex items-center gap-2 truncate">
+            <Columns3 className="w-4 h-4 text-[#D4A373] shrink-0" />
+            <span className="font-medium truncate">
+              Comparateur ({compareIds.length}/3 pièce{compareIds.length > 1 ? 's' : ''})
+            </span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => setIsCompareOpen(true)}
+              className="px-3.5 py-1.5 bg-[#D4A373] text-[#141413] font-semibold rounded-xl hover:bg-[#e1b78d] transition-colors whitespace-nowrap cursor-pointer"
+            >
+              Comparer côte à côte
+            </button>
+            <button
+              type="button"
+              onClick={() => setCompareIds([])}
+              className="p-1 text-[#A1A1AA] hover:text-white cursor-pointer"
+              aria-label="Vider le comparateur"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Side-by-Side Architectural Piece Comparator Modal */}
+      {isCompareOpen && comparedProducts.length > 0 && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/65 backdrop-blur-xs overflow-y-auto"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Comparateur architectural des créations"
+        >
+          <div className="bg-[#FAF7F2] border border-[#E5E0D5] rounded-2xl max-w-5xl w-full overflow-hidden shadow-2xl my-8">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-[#E5E0D5] bg-[#F2ECE1]">
+              <div>
+                <p className="text-[11px] font-mono uppercase tracking-wider text-[#C86D51]">
+                  Atelier & Prescription Architecturale
+                </p>
+                <h2 className="text-xl md:text-2xl font-display font-semibold text-[#141413]">
+                  Comparateur des Créations ({comparedProducts.length})
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsCompareOpen(false)}
+                className="p-2 text-[#57534E] hover:text-[#141413] rounded-lg cursor-pointer"
+                aria-label="Fermer le comparateur"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 overflow-x-auto">
+              <div
+                className="grid gap-5"
+                style={{
+                  gridTemplateColumns: `repeat(${comparedProducts.length}, minmax(240px, 1fr))`,
+                }}
+              >
+                {comparedProducts.map((item) => {
+                  const chosenId = selectedVariants[item.id] ?? item.variants[0]?.id;
+                  const activeVar =
+                    item.variants.find((v) => v.id === chosenId) || item.variants[0];
+
+                  return (
+                    <div
+                      key={item.id}
+                      className="bg-white border border-[#E5E0D5] rounded-2xl overflow-hidden flex flex-col justify-between"
+                    >
+                      <div>
+                        <div className="aspect-[4/3] bg-[#EFECE6] relative">
+                          <ResilientImage
+                            src={item.imageUrl}
+                            alt={item.title}
+                            className="w-full h-full object-cover"
+                          />
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setCompareIds((prev) => prev.filter((id) => id !== item.id))
+                            }
+                            aria-label={`Retirer ${item.title} du comparateur`}
+                            className="absolute top-2.5 right-2.5 p-1.5 rounded-full bg-[#141413]/75 text-white hover:bg-[#141413] cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+
+                        <div className="p-4 space-y-3 text-xs">
+                          <div>
+                            <div className="text-[10px] uppercase tracking-widest text-[#C86D51] font-medium">
+                              {item.category}
+                            </div>
+                            <h3 className="text-lg font-display font-semibold text-[#141413]">
+                              {item.title}
+                            </h3>
+                            <p className="text-[11px] text-[#78746C]">{item.subtitle}</p>
+                          </div>
+
+                          <div className="pt-2 border-t border-[#E5E0D5] flex items-baseline justify-between">
+                            <span className="text-[#57534E]">Tarif édition :</span>
+                            <span className="font-mono font-semibold text-sm text-[#141413] tabular-nums">
+                              {activeVar ? formatMoney(activeVar.priceCents, currency) : '—'}
+                            </span>
+                          </div>
+
+                          <div className="pt-2 border-t border-[#E5E0D5] space-y-1">
+                            <div className="font-semibold text-[#141413]">Dimensions</div>
+                            <div className="text-[#57534E] leading-relaxed">
+                              {item.dimensions}
+                            </div>
+                          </div>
+
+                          <div className="pt-2 border-t border-[#E5E0D5] space-y-1">
+                            <div className="font-semibold text-[#141413]">
+                              Façonnage & Tropicalisation
+                            </div>
+                            <div className="text-[#57534E] leading-relaxed">
+                              {item.craftsmanship}
+                            </div>
+                          </div>
+
+                          <div className="pt-2 border-t border-[#E5E0D5] flex items-center justify-between">
+                            <span className="text-[#57534E]">Finitions ({item.variants.length})</span>
+                            <span className="font-mono text-[#141413]">
+                              {activeVar?.stock ?? 0} en stock
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="p-4 pt-0 flex gap-2">
+                        <button
+                          type="button"
+                          disabled={!activeVar || activeVar.stock <= 0}
+                          onClick={() => {
+                            if (activeVar) {
+                              handleAddToCart(activeVar.id, 1);
+                              setIsCompareOpen(false);
+                              setIsCartOpen(true);
+                            }
+                          }}
+                          className="flex-1 py-2.5 px-3 bg-[#141413] text-[#FAF7F2] text-xs font-medium rounded-xl hover:bg-[#292826] disabled:opacity-40 transition-colors cursor-pointer"
+                        >
+                          Acquérir
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsCompareOpen(false);
+                            setPdpProduct(item);
+                            setPdpQty(1);
+                          }}
+                          className="px-3 py-2.5 border border-[#DED8CC] bg-[#FAF7F2] text-[#141413] text-xs font-medium rounded-xl hover:bg-[#F2ECE1] cursor-pointer"
+                        >
+                          Éditions
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Order Certificate & Mobile Money Confirmation Modal */}
       <OrderSandboxModal

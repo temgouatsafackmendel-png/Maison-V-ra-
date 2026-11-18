@@ -12,6 +12,7 @@ import {
   Clock,
   PackageCheck,
   Truck,
+  Navigation,
 } from 'lucide-react';
 import type {
   CurrencyCode,
@@ -27,6 +28,7 @@ import {
   formatOrderStatusLabel,
   formatPaymentMethodLabel,
 } from '../utils/format.ts';
+import { CourierLiveMap } from './CourierLiveMap.tsx';
 
 interface OrderSandboxModalProps {
   order: OrderDTO | null;
@@ -52,10 +54,12 @@ export const OrderSandboxModal: React.FC<OrderSandboxModalProps> = ({
     message: string;
   } | null>(null);
   const [loadingAction, setLoadingAction] = useState<string | null>(null);
+  const [modalTab, setModalTab] = useState<'details' | 'gps'>('details');
 
   useEffect(() => {
     setCurrentOrder(order);
     setStatusBanner(null);
+    setModalTab('details');
     if (order) {
       fetchOrderDetails(order.id, order.paymentIntentId);
     }
@@ -276,6 +280,54 @@ export const OrderSandboxModal: React.FC<OrderSandboxModalProps> = ({
 
         {/* Body */}
         <div className="p-6 space-y-6 max-h-[80vh] overflow-y-auto">
+          {!isCancelledOrFailed && (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex gap-1 p-1 bg-[#F2ECE1] border border-[#E5E0D5] rounded-xl w-fit">
+                <button
+                  type="button"
+                  onClick={() => setModalTab('details')}
+                  className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors cursor-pointer ${
+                    modalTab === 'details'
+                      ? 'bg-[#141413] text-[#FAF7F2]'
+                      : 'text-[#57534E] hover:text-[#141413]'
+                  }`}
+                >
+                  Certificat & Règlement
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setModalTab('gps')}
+                  className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors cursor-pointer ${
+                    modalTab === 'gps'
+                      ? 'bg-[#141413] text-[#FAF7F2]'
+                      : 'text-[#57534E] hover:text-[#141413]'
+                  }`}
+                >
+                  <Navigation className="w-3.5 h-3.5 text-[#C86D51]" />
+                  <span>
+                    Suivi GPS Coursier
+                    {currentOrder.tracking?.status === 'en_route' ||
+                    currentOrder.tracking?.status === 'arriving_soon'
+                      ? ` · ${currentOrder.tracking.etaMinutes} min`
+                      : ''}
+                  </span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {modalTab === 'gps' && !isCancelledOrFailed ? (
+            <CourierLiveMap
+              order={currentOrder}
+              authToken={authToken}
+              compact
+              onOrderUpdated={(updated) => {
+                setCurrentOrder(updated);
+                onOrderUpdated(updated);
+              }}
+            />
+          ) : (
+            <>
           {statusBanner && (
             <div
               className={`p-4 rounded-xl border text-xs flex items-center gap-2.5 ${
@@ -562,6 +614,8 @@ export const OrderSandboxModal: React.FC<OrderSandboxModalProps> = ({
                 ))}
               </div>
             </div>
+          )}
+            </>
           )}
         </div>
 

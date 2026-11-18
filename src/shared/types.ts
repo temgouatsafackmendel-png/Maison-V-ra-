@@ -92,6 +92,43 @@ export type OrderStatus =
   | 'cancelled'
   | 'payment_failed';
 
+export type CourierTrackingStatus =
+  | 'awaiting_dispatch'
+  | 'en_route'
+  | 'arriving_soon'
+  | 'delivered';
+
+export interface CourierWaypoint {
+  lat: number;
+  lng: number;
+  label: string;
+}
+
+export interface CourierTrackingDTO {
+  orderId: number;
+  courierName: string;
+  courierPhone: string;
+  vehicleLabel: string;
+  vehiclePlate: string;
+  hubName: string;
+  originLat: number;
+  originLng: number;
+  destinationLat: number;
+  destinationLng: number;
+  currentLat: number;
+  currentLng: number;
+  headingDeg: number;
+  speedKmh: number;
+  progressPct: number;
+  etaMinutes: number;
+  distanceRemainingKm: number;
+  totalDistanceKm: number;
+  status: CourierTrackingStatus;
+  lastCheckpoint: string;
+  waypoints: CourierWaypoint[];
+  updatedAt: string;
+}
+
 export interface OrderItemDTO {
   id: number;
   productId: number;
@@ -131,6 +168,7 @@ export interface OrderDTO {
   createdAt: string;
   updatedAt: string;
   items: OrderItemDTO[];
+  tracking?: CourierTrackingDTO;
 }
 
 export interface CouponDTO {
@@ -179,3 +217,66 @@ export interface AuditLogDTO {
   ipAddress: string;
   createdAt: string;
 }
+
+export type AppointmentStatus =
+  | 'pending'
+  | 'confirmed'
+  | 'completed'
+  | 'rescheduled';
+
+export interface ConciergeAppointmentDTO {
+  id: number;
+  referenceCode: string;
+  showroomCity: string;
+  customerName: string;
+  customerPhone: string;
+  customerEmail: string;
+  preferredDate: string;
+  projectNote: string;
+  status: AppointmentStatus;
+  createdAt: string;
+}
+
+export type RestockUrgency = 'critical' | 'warning' | 'nominal';
+
+export interface StockHistoryPointDTO {
+  date: string;
+  label: string;
+  isForecast: boolean;
+  actualStock: number | null;
+  projectedStock: number | null;
+  safetyThreshold: number;
+  unitsSold: number;
+  restockUnits: number;
+}
+
+export interface VariantRestockPredictionDTO {
+  variantId: number;
+  productId: number;
+  productTitle: string;
+  category: Product['category'];
+  sku: string;
+  variantName: string;
+  currentStock: number;
+  soldLast30d: number;
+  dailyVelocity: number;
+  daysUntilStockout: number | null;
+  projectedStock14d: number;
+  recommendedRestockQty: number;
+  urgency: RestockUrgency;
+  series: StockHistoryPointDTO[];
+}
+
+export interface InventoryAnalyticsDTO {
+  generatedAt: string;
+  windowDays: number;
+  forecastDays: number;
+  totalUnitsInStock: number;
+  totalSoldLast30d: number;
+  criticalVariantsCount: number;
+  totalRecommendedRestockUnits: number;
+  globalSeries: StockHistoryPointDTO[];
+  variants: VariantRestockPredictionDTO[];
+}
+
+
