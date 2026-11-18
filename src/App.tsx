@@ -684,6 +684,11 @@ export default function App() {
             }}
             onLogout={handleLogout}
             onOpenOrderSandbox={(order) => setSandboxOrder(order)}
+            onReorderItems={(itemsToReorder) => {
+              setCartItems(itemsToReorder);
+              setActiveView('storefront');
+              setIsCartOpen(true);
+            }}
           />
         ) : activeView === 'craftsmanship' ? (
           /* Interactive La Maison & Galeries View */
